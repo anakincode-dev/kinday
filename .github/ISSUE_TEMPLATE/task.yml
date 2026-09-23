@@ -1,0 +1,29 @@
+name: Задача
+description: Новая функциональность или изменение поведения
+labels: ["task"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Цель
+      description: Какой результат нужен и кому он нужен.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Объём работы
+      description: Что входит в задачу и что явно не входит.
+    validations:
+      required: true
+
+  - type: textarea
+    id: done
+    attributes:
+      label: Критерии готовности
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true

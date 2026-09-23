@@ -1,0 +1,37 @@
+name: Баг
+description: Что-то работает не так, как ожидалось
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Что произошло
+      description: Фактическое поведение, включая текст ошибки.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что ожидалось
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия или коммит
+      placeholder: 0.1.0 или SHA коммита
+    validations:
+      required: false

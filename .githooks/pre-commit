@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Pre-commit checks. Activate with: git config core.hooksPath .githooks
+# Bypass once with: git commit --no-verify
+set -uo pipefail
+
+fail=0
+say() { printf '%s\n' "$*" >&2; }
+
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+if [ "$branch" = "main" ] && [ "${ALLOW_MAIN_COMMIT:-0}" != "1" ]; then
+  say "pre-commit: прямые коммиты в main запрещены."
+  say "  Создай ветку:  git switch -c feat/<короткое-имя>"
+  say "  Обойти:        ALLOW_MAIN_COMMIT=1 git commit ..."
+  exit 1
+fi
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+
+runner=""
+if command -v uv >/dev/null 2>&1; then
+  runner="uv run"
+elif command -v ruff >/dev/null 2>&1; then
+  runner=""
+else
+  say "pre-commit: ruff и uv не найдены, проверки пропущены."
+  say "  Поставить:     pip install uv   (или см. CONTRIBUTING.md)"
+  exit 0
+fi
+
+if [ ${#staged[@]} -gt 0 ]; then
+  say "pre-commit: проверяю ${#staged[@]} файлов Python..."
+
+  if ! $runner ruff format --check -- "${staged[@]}"; then
+    say "pre-commit: форматирование не соответствует. Исправь: ruff format ."
+    fail=1
+  fi
+
+  if ! $runner ruff check -- "${staged[@]}"; then
+    say "pre-commit: линтер нашёл проблемы. Часть чинится: ruff check --fix ."
+    fail=1
+  fi
+fi
+
+if [ -d tests ]; then
+  if ! $runner pytest -q; then
+    say "pre-commit: тесты не прошли."
+    fail=1
+  fi
+fi
+
+exit "$fail"
