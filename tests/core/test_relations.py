@@ -270,6 +270,42 @@ def test_attach_parent_none_with_siblings_raises_siblings_question_required() ->
     assert exc_info.value.sibling_ids == [MARINA_ID]
 
 
+def test_attach_parent_question_lists_only_siblings_with_free_slot() -> None:
+    """Уточнение: в списке вопроса — только братья/сёстры со свободным слотом."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=HALF_SIBLING_ID),
+        ParentOf(parent_id=HALF_SIBLING_OTHER_PARENT_ID, child_id=HALF_SIBLING_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    with pytest.raises(SiblingsQuestionRequired) as exc_info:
+        attach_parent(ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people)
+
+    assert exc_info.value.sibling_ids == [MARINA_ID]
+
+
+def test_attach_parent_no_question_when_all_siblings_already_have_two_parents() -> None:
+    """Уточнение: если свободного слота нет ни у кого, вопрос не задаётся вовсе."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=HALF_SIBLING_ID),
+        ParentOf(parent_id=HALF_SIBLING_OTHER_PARENT_ID, child_id=HALF_SIBLING_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people
+    )
+
+    assert result == ParentChange(
+        added=[ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)],
+        removed=[],
+        removed_placeholder_id=None,
+    )
+
+
 def test_attach_parent_second_parent_via_son_daughter_path_also_asks() -> None:
     """Тот же путь для «сын/дочь»: вызов attach_parent(new_child_id, person_id, ...)
 
@@ -490,3 +526,18 @@ def test_infer_relation_text_placeholder_as_hero_returns_empty() -> None:
     }
 
     assert infer_relation_text(ANTON_ID, PLACEHOLDER_ID, people, relations) == ""
+
+
+def test_infer_relation_text_hero_without_gender_returns_empty() -> None:
+    """Уточнение: пол героя не задан (не заглушка) — текст остаётся только с именем."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        MARINA_ID: _person(MARINA_ID, gender=None),
+    }
+
+    assert infer_relation_text(ANTON_ID, MARINA_ID, people, relations) == ""

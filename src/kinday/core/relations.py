@@ -214,14 +214,15 @@ def attach_parent(
       уже висят на заглушке и получат правильного родителя вместе с ней.
     - Родителей нет → одно ребро parent_of(new_parent_id, person_id).
     - Один настоящий родитель:
-      - если у него есть другие дети (братья и сёстры person_id) и
+      - если среди других детей этого родителя (братьев и сестёр person_id)
+        есть хотя бы один со свободным слотом (меньше двух родителей) и
         also_parent_of_siblings is None → SiblingsQuestionRequired со списком
-        их id, вызывающий код (бот) должен спросить пользователя и повторить
-        вызов с явным True/False;
-      - «да» — рёбра тянутся к person_id и к каждому брату/сестре, у кого
-        есть свободный слот (кто уже сводный с двумя родителями — пропускаем,
-        не падаем); «нет» — только к person_id;
-      - других детей нет — вопрос не нужен, ребро сразу к person_id.
+        id только таких, свободных, братьев и сестёр — вызывающий код (бот)
+        должен спросить пользователя и повторить вызов с явным True/False;
+      - «да» — рёбра тянутся к person_id и к каждому из этого списка;
+        «нет» — только к person_id;
+      - других детей нет, либо все они уже сводные с двумя родителями —
+        вопрос не нужен (спрашивать не о чем), ребро сразу к person_id.
     - Двое родителей (оба настоящие) → отказ (SPEC 4.1, критерий 21).
 
     `people` должен содержать запись для каждого id, уже фигурирующего как
@@ -249,22 +250,28 @@ def attach_parent(
         raise ValueError(f"У человека {person_id} уже есть двое родителей")
 
     only_parent_id = existing_parent_ids[0]
-    siblings = sorted(
+    all_siblings = sorted(
         {r.child_id for r in relations if r.parent_id == only_parent_id and r.child_id != person_id}
     )
+    siblings_with_free_slot = [
+        sibling_id
+        for sibling_id in all_siblings
+        if len(_parent_ids(sibling_id, relations)) < MAX_PARENTS
+    ]
 
-    if not siblings:
+    if not siblings_with_free_slot:
         edge = ParentOf(parent_id=new_parent_id, child_id=person_id)
         return ParentChange(added=[edge], removed=[], removed_placeholder_id=None)
 
     if also_parent_of_siblings is None:
-        raise SiblingsQuestionRequired(siblings)
+        raise SiblingsQuestionRequired(siblings_with_free_slot)
 
     added = [ParentOf(parent_id=new_parent_id, child_id=person_id)]
     if also_parent_of_siblings:
-        for sibling_id in siblings:
-            if len(_parent_ids(sibling_id, relations)) < MAX_PARENTS:
-                added.append(ParentOf(parent_id=new_parent_id, child_id=sibling_id))
+        added.extend(
+            ParentOf(parent_id=new_parent_id, child_id=sibling_id)
+            for sibling_id in siblings_with_free_slot
+        )
 
     return ParentChange(added=added, removed=[], removed_placeholder_id=None)
 
