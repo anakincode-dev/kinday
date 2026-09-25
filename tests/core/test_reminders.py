@@ -117,6 +117,115 @@ def test_due_at_utc_recomputes_on_event_date_change() -> None:
     assert after - before == timedelta(days=9)
 
 
+def test_materialize_for_event_skips_recipient_with_delivery_disabled() -> None:
+    """SPEC 5.5, критерий 403: получателю с delivery_enabled=False напоминания не строятся."""
+    clock = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
+    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 3, 1))
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+    account = _account(1, "Europe/Moscow", offsets=(0,))
+    account.delivery_enabled = False
+
+    reminders = materialize_for_event(event, [(membership, account)], clock)
+
+    assert reminders == []
+
+
+def test_materialize_for_event_builds_reminder_not_yet_past_in_recipient_timezone() -> None:
+    """По UTC-дате событие уже "прошло", но по поясу получателя дата ещё не прошла, а
+    отправка впереди — напоминание всё равно строится (поиск идёт от "сегодня по UTC
+    минус 1 день", отсекается по due_at_utc и локальной дате получателя)."""
+    clock = FixedClock(datetime(2027, 3, 2, 1, 0, tzinfo=UTC))
+    event = Event(
+        id=100,
+        family_id=1,
+        person_id=2,
+        title="Разовое событие",
+        date=date(2027, 3, 1),
+        is_recurring_yearly=False,
+    )
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+    account = _account(1, "Pacific/Honolulu", offsets=(0,))
+    account.time_of_day = time(20, 0)
+
+    reminders = materialize_for_event(event, [(membership, account)], clock)
+
+    assert len(reminders) == 1
+    assert reminders[0].occurrence_date == date(2027, 3, 1)
+    assert reminders[0].due_at_utc == datetime(2027, 3, 2, 6, 0, tzinfo=UTC)
+    assert reminders[0].due_at_utc > clock.now()
+
+
+def test_materialize_for_event_drops_reminder_overdue_more_than_misfire_grace() -> None:
+    """due_at_utc старше now на 24 часа и больше — напоминание не строится (см. MISFIRE_GRACE,
+    иначе тик тут же пометил бы его missed, см. SPEC 5.5).
+
+    occurrence_date (2027-03-05) намеренно оставлена в будущем относительно today_local,
+    чтобы просрочку давал исключительно большой offset_days, а не фильтр по локальной дате
+    получателя — иначе тест прошёл бы даже без проверки MISFIRE_GRACE.
+    """
+    clock = FixedClock(datetime(2027, 3, 2, 1, 0, tzinfo=UTC))
+    event = Event(
+        id=100,
+        family_id=1,
+        person_id=2,
+        title="Разовое событие",
+        date=date(2027, 3, 5),
+        is_recurring_yearly=False,
+    )
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+    account = _account(1, "UTC", offsets=(5,))
+    account.time_of_day = time(0, 0)
+
+    reminders = materialize_for_event(event, [(membership, account)], clock)
+
+    assert reminders == []
+
+
+def test_materialize_for_event_keeps_reminder_overdue_less_than_misfire_grace() -> None:
+    """Опоздание меньше 24 часов при непрошедшей (в поясе получателя) дате — строится."""
+    clock = FixedClock(datetime(2027, 3, 2, 1, 0, tzinfo=UTC))
+    event = Event(
+        id=100,
+        family_id=1,
+        person_id=2,
+        title="Разовое событие",
+        date=date(2027, 3, 1),
+        is_recurring_yearly=False,
+    )
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+    account = _account(1, "Pacific/Honolulu", offsets=(0,))
+    account.time_of_day = time(10, 0)
+
+    reminders = materialize_for_event(event, [(membership, account)], clock)
+
+    assert len(reminders) == 1
+    assert reminders[0].due_at_utc == datetime(2027, 3, 1, 20, 0, tzinfo=UTC)
+
+
+def test_materialize_for_event_feb_29_gives_feb_28_occurrence_in_common_year() -> None:
+    """Критерий 4 на уровне напоминаний: 29 февраля в невисокосный год -> 28 февраля."""
+    clock = FixedClock(datetime(2027, 1, 15, tzinfo=UTC))
+    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 2, 29))
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+
+    reminders = materialize_for_event(
+        event, [(membership, _account(1, "Europe/Moscow", offsets=(0,)))], clock
+    )
+
+    assert {r.occurrence_date for r in reminders} == {date(2027, 2, 28)}
+
+
+def test_due_at_utc_ambiguous_fall_back_time_takes_first_moment() -> None:
+    """Неоднозначное время при переводе назад (Europe/Berlin): берётся первый момент (fold=0)."""
+    account = _account(1, "Europe/Berlin", offsets=(0,))
+    account.time_of_day = time(2, 30)
+    occurrence = date(2027, 10, 31)
+
+    due = due_at_utc(occurrence, 0, account)
+
+    assert due == datetime(2027, 10, 31, 0, 30, tzinfo=UTC)
+
+
 def test_materialize_for_event_only_builds_future_occurrences() -> None:
     """Критерии 6, 7: перематериализация строит только будущее, прошлое не переписывается.
 
