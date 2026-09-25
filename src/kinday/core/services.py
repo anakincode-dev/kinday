@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from datetime import date, time
+import secrets
+import string
+from dataclasses import replace
+from datetime import date, time, timedelta
 
 from kinday.core.models import (
     BIRTHDAY_EVENT_TITLE,
@@ -19,7 +22,9 @@ from kinday.core.models import (
     Membership,
     ParentOf,
     Person,
+    Reminder,
     ReminderOverride,
+    SpouseOf,
 )
 from kinday.core.ports import (
     AccountRepo,
@@ -34,10 +39,15 @@ from kinday.core.ports import (
     ReminderRepo,
 )
 from kinday.core.relations import RelationKind, add_sibling, add_spouse, attach_parent
-from kinday.core.reminders import materialize_for_event
+from kinday.core.reminders import MISFIRE_GRACE, materialize_for_event
 
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
+
+# SPEC 5.7: алфавит ограничен параметром start в t.me-ссылке, 22 символа — 128 бит энтропии.
+INVITE_CODE_ALPHABET = string.ascii_letters + string.digits + "_-"
+INVITE_CODE_LENGTH = 22
+INVITE_TTL = timedelta(days=7)
 
 # Заведомо невозможный id человека: репозитории выдают только положительные id.
 # Используется, чтобы прогнать attach_parent «вхолостую» и убедиться, что она
@@ -304,6 +314,45 @@ async def add_person(
     return new_person
 
 
+async def _rematerialize_event_for_person(
+    event: Event,
+    membership: Membership,
+    account: Account,
+    override_repo: ReminderOverrideRepo,
+    reminder_repo: ReminderRepo,
+    clock: Clock,
+) -> None:
+    """Пересчитывает будущие pending-напоминания одного человека по одному событию.
+
+    Удаляет будущие pending-строки только этой пары (событие, человек) и строит
+    заново — остальных получателей события не трогает. Применяет переопределение
+    (SPEC 5.6): если для пары (account_id, event_id) есть ReminderOverride, его
+    смещения и время суток перекрывают настройки аккаунта — переопределение не
+    должно теряться при смене общих настроек аккаунта или даты события.
+
+    Порог удаления — MISFIRE_GRACE назад от текущего момента, а не сам момент:
+    materialize_for_event тем же порогом (not_before в reminders.py) решает,
+    какие строки ещё стоит построить заново. Если бы порог удаления был уже
+    (например, ровно `now`), строка с due_at_utc в промежутке [now-MISFIRE_GRACE,
+    now) осталась бы неудалённой со старым due_at_utc, а materialize_for_event
+    всё равно попытался бы построить для того же (event_id, person_id,
+    occurrence_date, offset_days) новую — в SQLite её отбросит уникальный
+    индекс (SPEC 5.3), и смена настроек молча не применилась бы к этой строке.
+    """
+    override = await override_repo.get(membership.account_id, event.id)
+    effective_account = account
+    if override is not None:
+        effective_account = replace(
+            account, offsets_days=override.offsets_days, time_of_day=override.time_of_day
+        )
+    await reminder_repo.delete_future_pending_for_event_and_person(
+        event.id, membership.person_id, clock.now() - timedelta(seconds=MISFIRE_GRACE)
+    )
+    reminders = materialize_for_event(event, [(membership, effective_account)], clock)
+    if reminders:
+        await reminder_repo.add_many(reminders)
+
+
 async def update_person(
     acting_account_id: int,
     person_id: int,
@@ -314,15 +363,45 @@ async def update_person(
     event_repo: EventRepo,
     family_repo: FamilyRepo,
     person_repo: PersonRepo,
+    membership_repo: MembershipRepo,
+    override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Person:
     """Правит запись человека. Смена даты рождения перестраивает будущие
 
-    напоминания по его дню рождения (SPEC 5.6, критерий приёмки 7).
-    Отклоняет действие, если acting_account не владелец семьи (family_repo).
+    напоминания по его дню рождения (SPEC 5.6, критерий приёмки 7): дата
+    события дня рождения (EventRepo.update) переставляется на новую
+    birth_date, будущие pending-напоминания по нему пересчитываются для всех
+    получателей семьи (переопределения, если есть, сохраняются — см.
+    _rematerialize_event_for_person). У человека всегда есть ровно одно
+    событие kind=BIRTHDAY — оно заводится один раз при создании (см.
+    _materialize_birthday) и больше не дублируется. Отклоняет действие, если
+    acting_account не владелец семьи (family_repo).
     """
-    raise NotImplementedError
+    person = await person_repo.get(person_id)
+    await _require_owner(family_repo, person.family_id, acting_account_id)
+
+    birth_date_changed = person.birth_date != birth_date
+    person.name = name
+    person.gender = gender
+    person.birth_date = birth_date
+    person = await person_repo.update(person)
+
+    if birth_date_changed:
+        [birthday_event] = [
+            e for e in await event_repo.list_by_person(person_id) if e.kind == EventKind.BIRTHDAY
+        ]
+        birthday_event.date = birth_date
+        birthday_event = await event_repo.update(birthday_event)
+
+        recipients = await _recipients(person.family_id, membership_repo, account_repo)
+        for membership, account in recipients:
+            await _rematerialize_event_for_person(
+                birthday_event, membership, account, override_repo, reminder_repo, clock
+            )
+
+    return person
 
 
 async def delete_person(
@@ -332,35 +411,110 @@ async def delete_person(
     family_repo: FamilyRepo,
     person_repo: PersonRepo,
     relation_repo: RelationRepo,
+    membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
 ) -> None:
     """Удаляет человека физически, либо, если у него есть дети, превращает
 
     его в заглушку: имя, пол, дата рождения и привязка аккаунта стираются,
     события и напоминания удаляются, рёбра к детям остаются (SPEC 4.3,
-    критерий приёмки 22). Отклоняет действие, если acting_account не владелец
+    критерий приёмки 22). Рёбра, где person_id сам ребёнок (к своим родителям)
+    или супруг, удаляются в обоих случаях — SPEC называет заглушкой узел без
+    имени, пола и даты рождения, несущий рёбра только к детям (см.
+    create_placeholder_parent), поэтому у заглушки не может остаться ни
+    родителей, ни супруга. Отклоняет действие, если acting_account не владелец
     семьи (family_repo).
     """
-    raise NotImplementedError
+    person = await person_repo.get(person_id)
+    await _require_owner(family_repo, person.family_id, acting_account_id)
+
+    for event in await event_repo.list_by_person(person_id):
+        await reminder_repo.delete_all_for_event(event.id)
+        await event_repo.delete(event.id)
+    await reminder_repo.delete_all_for_person(person_id)
+    await membership_repo.delete(person_id)
+
+    relations = await relation_repo.list_by_family(person.family_id)
+    has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
+    for relation in relations:
+        if (isinstance(relation, ParentOf) and relation.child_id == person_id) or (
+            isinstance(relation, SpouseOf) and person_id in (relation.a_id, relation.b_id)
+        ):
+            await relation_repo.remove(person.family_id, relation)
+
+    if has_children:
+        person.name = None
+        person.gender = None
+        person.birth_date = None
+        person.is_placeholder = True
+        await person_repo.update(person)
+    else:
+        await person_repo.delete(person_id)
+
+
+def _generate_invite_code() -> str:
+    return "".join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(INVITE_CODE_LENGTH))
 
 
 async def issue_invite(
     acting_account_id: int,
     person_id: int,
+    family_repo: FamilyRepo,
+    person_repo: PersonRepo,
+    membership_repo: MembershipRepo,
     invite_repo: InviteRepo,
     clock: Clock,
 ) -> Invite:
-    """Одноразовое приглашение сроком на семь дней. Отклоняет, если человек уже привязан."""
-    raise NotImplementedError
+    """Одноразовое приглашение сроком на семь дней.
+
+    Отклоняет, если acting_account не владелец семьи (family_repo), и если
+    запись уже привязана к какому-то аккаунту (критерий приёмки 26) — привязка
+    проверяется по MembershipRepo.get_by_person, а не по факту существования
+    приглашения: прежние отозванные или просроченные приглашения на ту же
+    запись не мешают выдать новое. Отклоняет и заглушку (SPEC 4.1: без имени,
+    пола и даты рождения, не показывается в списках) — приглашение по SPEC 3.2
+    показывает получателю «Антон приглашает вас как Марину», а заглушке
+    показывать нечего.
+    """
+    person = await person_repo.get(person_id)
+    await _require_owner(family_repo, person.family_id, acting_account_id)
+
+    if person.is_placeholder:
+        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, не приглашается")
+    if await membership_repo.get_by_person(person_id) is not None:
+        raise ValueError(f"Запись {person_id} уже привязана к аккаунту")
+
+    now = clock.now()
+    return await invite_repo.create(
+        Invite(
+            id=0,
+            family_id=person.family_id,
+            person_id=person_id,
+            code=_generate_invite_code(),
+            created_at=now,
+            expires_at=now + INVITE_TTL,
+        )
+    )
 
 
 async def revoke_invite(
     acting_account_id: int,
     invite_id: int,
+    family_repo: FamilyRepo,
     invite_repo: InviteRepo,
+    clock: Clock,
 ) -> None:
-    """Отзывает ещё не использованное приглашение (SPEC 3.2, критерий приёмки 25)."""
-    raise NotImplementedError
+    """Отзывает ещё не использованное приглашение (SPEC 3.2, критерий приёмки 25).
+
+    Отклоняет действие, если acting_account не владелец семьи, которой
+    принадлежит приглашение, и если оно уже использовано — отзывать больше
+    нечего, аккаунт уже привязан.
+    """
+    invite = await invite_repo.get(invite_id)
+    await _require_owner(family_repo, invite.family_id, acting_account_id)
+    if invite.used_at is not None:
+        raise ValueError(f"Приглашение {invite_id} уже использовано")
+    await invite_repo.revoke(invite_id, clock.now())
 
 
 async def accept_invite(
@@ -370,14 +524,85 @@ async def accept_invite(
     invite_repo: InviteRepo,
     person_repo: PersonRepo,
     account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
+    event_repo: EventRepo,
+    override_repo: ReminderOverrideRepo,
+    reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Person:
     """Привязывает Telegram-аккаунт к записи, на которую выдано приглашение.
 
-    Отклоняет просроченный, уже использованный или отозванный код
-    (критерий приёмки 25) и запись, к которой уже привязан аккаунт (критерий 26).
+    Отклоняет просроченный, уже использованный или отозванный код (критерий
+    приёмки 25) и запись, к которой уже привязан аккаунт (критерий 26, тот же
+    случай, что и в issue_invite — приглашение могло быть выдано раньше, чем
+    запись оказалась занята другим приглашением). Код привязан к конкретной
+    записи (критерий 24): чужой код не даёт привязаться ни к какой другой —
+    person_id берётся из самого приглашения, а не передаётся вызывающим кодом.
+    Отклоняет и случай, когда у аккаунта уже есть своя запись в этой самой
+    семье (SPEC 5.3: не больше одной записи человека на пару account_id и
+    family_id) — иначе в memberships оказалось бы два ряда с одинаковой парой.
+
+    Если у telegram-аккаунта уже есть запись (он раньше создал или принял
+    приглашение в другую семью, см. SPEC 2.1), она переиспользуется как есть и
+    `timezone` учитывается только при первом создании аккаунта — так же, как
+    в create_family. Новый участник сразу получает напоминания обо всех уже
+    существующих событиях своей семьи (SPEC 5.6: «добавлен человек... привязан
+    аккаунт» — повод для материализации), кроме собственного дня рождения, с
+    учётом уже выставленных на эти события переопределений (SPEC 5.3, 5.6):
+    владелец мог настроить ReminderOverride для этого аккаунта на событие ещё
+    до того, как приглашение было принято.
     """
-    raise NotImplementedError
+    invite = await invite_repo.get_by_code(code)
+    if invite is None:
+        raise ValueError("Приглашение не найдено")
+
+    now = clock.now()
+    if invite.revoked_at is not None:
+        raise ValueError("Приглашение отозвано")
+    if invite.used_at is not None:
+        raise ValueError("Приглашение уже использовано")
+    if now > invite.expires_at:
+        raise ValueError("Приглашение просрочено")
+    if await membership_repo.get_by_person(invite.person_id) is not None:
+        raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+
+    account = await account_repo.get_by_telegram_user_id(telegram_user_id)
+    if account is None:
+        account = await account_repo.save(
+            Account(
+                id=0,
+                telegram_user_id=telegram_user_id,
+                current_family_id=None,
+                timezone=timezone,
+                offsets_days=DEFAULT_OFFSETS_DAYS,
+                time_of_day=DEFAULT_TIME_OF_DAY,
+            )
+        )
+    elif await membership_repo.get_by_account_and_family(account.id, invite.family_id) is not None:
+        raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+
+    membership = await membership_repo.create(
+        Membership(account_id=account.id, family_id=invite.family_id, person_id=invite.person_id)
+    )
+    await invite_repo.mark_used(invite.id, now)
+
+    if account.current_family_id is None:
+        account.current_family_id = invite.family_id
+        account = await account_repo.save(account)
+
+    reminders: list[Reminder] = []
+    for event in await event_repo.list_by_family(invite.family_id):
+        override = await override_repo.get(account.id, event.id)
+        effective_account = account
+        if override is not None:
+            effective_account = replace(
+                account, offsets_days=override.offsets_days, time_of_day=override.time_of_day
+            )
+        reminders.extend(materialize_for_event(event, [(membership, effective_account)], clock))
+    if reminders:
+        await reminder_repo.add_many(reminders)
+
+    return await person_repo.get(invite.person_id)
 
 
 async def add_event(
@@ -432,17 +657,33 @@ async def update_account_settings(
     offsets_days: tuple[int, ...],
     time_of_day: time,
     account_repo: AccountRepo,
-    person_repo: PersonRepo,
+    membership_repo: MembershipRepo,
     event_repo: EventRepo,
+    override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Account:
     """Меняет пояс, смещения и время суток. Настройки принадлежат аккаунту, а не
 
-    семье: перестраивает будущие напоминания во всех его семьях сразу
-    (SPEC 2.1, 5.6, критерий приёмки 6). Уже отправленные напоминания не трогает.
+    семье: перестраивает будущие напоминания во всех его семьях сразу (SPEC
+    2.1, 5.6, критерий приёмки 6), по каждому активному событию каждой из них.
+    Переопределения на отдельные события (ReminderOverrideRepo) сохраняют силу
+    — их учитывает _rematerialize_event_for_person. Уже отправленные
+    напоминания не трогает: пересчитываются только будущие pending-строки.
     """
-    raise NotImplementedError
+    account = await account_repo.get(account_id)
+    account.timezone = timezone
+    account.offsets_days = offsets_days
+    account.time_of_day = time_of_day
+    account = await account_repo.save(account)
+
+    for membership in await membership_repo.list_by_account(account_id):
+        for event in await event_repo.list_by_family(membership.family_id):
+            await _rematerialize_event_for_person(
+                event, membership, account, override_repo, reminder_repo, clock
+            )
+
+    return account
 
 
 async def set_override(
@@ -453,20 +694,49 @@ async def set_override(
     override_repo: ReminderOverrideRepo,
     event_repo: EventRepo,
     account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> ReminderOverride:
     """Переопределяет смещения и время суток для пары (аккаунт, событие) и
 
-    перестраивает будущие напоминания по этому событию для этого аккаунта (SPEC 5.6).
+    перестраивает будущие напоминания по этому событию для этого аккаунта
+    (SPEC 5.6). Если аккаунт не состоит в семье этого события, переопределение
+    всё равно сохраняется (пригодится, если он позже присоединится), но
+    пересчитывать пока нечего.
     """
-    raise NotImplementedError
+    override = ReminderOverride(
+        account_id=account_id,
+        event_id=event_id,
+        offsets_days=offsets_days,
+        time_of_day=time_of_day,
+    )
+    await override_repo.set(override)
+
+    event = await event_repo.get(event_id)
+    membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
+    if membership is not None:
+        account = await account_repo.get(account_id)
+        await _rematerialize_event_for_person(
+            event, membership, account, override_repo, reminder_repo, clock
+        )
+
+    return override
 
 
 async def set_current_family(
     account_id: int,
     family_id: int,
     account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
 ) -> Account:
-    """Меняет текущую семью аккаунта, к которой относятся команды добавления и просмотра."""
-    raise NotImplementedError
+    """Меняет текущую семью аккаунта, к которой относятся команды добавления и просмотра.
+
+    Отклоняет семью, в которой у аккаунта нет своей записи (membership_repo).
+    """
+    if await membership_repo.get_by_account_and_family(account_id, family_id) is None:
+        raise ValueError(f"Аккаунт {account_id} не состоит в семье {family_id}")
+
+    account = await account_repo.get(account_id)
+    account.current_family_id = family_id
+    return await account_repo.save(account)

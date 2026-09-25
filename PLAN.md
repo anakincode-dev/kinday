@@ -78,7 +78,7 @@ in-memory реализации в тестах). `add_person` и `add_event` с�
 Готово: сценарии создания проходят на in-memory реализациях портов, `core`
 всё ещё не знает про SQLite.
 
-## Этап 3b. Ядро: приглашения, редактирование, настройки
+## Этап 3b. Ядро: приглашения, редактирование, настройки (готово)
 
 `issue_invite`, `revoke_invite`, `accept_invite`, `delete_person`,
 `update_person`, `update_account_settings`, `set_override`,
