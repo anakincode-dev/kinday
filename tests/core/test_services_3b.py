@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import re
+from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
 
 import pytest
@@ -21,6 +23,7 @@ from kinday.core.models import (
     Membership,
     ParentOf,
     Person,
+    ReminderStatus,
     SpouseOf,
 )
 from kinday.core.relations import RelationKind
@@ -135,14 +138,41 @@ async def _accept_invite(
 
 
 def _snapshot(repos: Repos) -> dict[str, object]:
-    return {
-        "people": dict(repos.person.people),
-        "accounts": dict(repos.account.accounts),
-        "memberships": list(repos.membership.memberships),
-        "events": dict(repos.event.events),
-        "relations": {k: list(v) for k, v in repos.relation.relations.items()},
-        "reminders": list(repos.reminder.reminders),
-    }
+    """Глубокая копия всего хранилища — для проверок «ничего не записано».
+
+    Копия именно глубокая: сценарии меняют поля Person и Reminder на месте
+    (например, превращение в заглушку), а поверхностная копия контейнеров
+    такую правку не заметила бы и тест прошёл бы при сломанном коде.
+    """
+    return deepcopy(
+        {
+            "people": repos.person.people,
+            "accounts": repos.account.accounts,
+            "memberships": repos.membership.memberships,
+            "events": repos.event.events,
+            "relations": repos.relation.relations,
+            "reminders": repos.reminder.reminders,
+        }
+    )
+
+
+def _dangling_relations(repos: Repos, family_id: int) -> list[object]:
+    """Рёбра, ссылающиеся на несуществующего человека.
+
+    Физическое удаление обязано снимать все рёбра удаляемого узла: в SQLite
+    при PRAGMA foreign_keys=ON (SPEC 6.2) висячее ребро либо не даст удалить
+    строку, либо утащит за собой чужие рёбра каскадом.
+    """
+    alive = set(repos.person.people)
+    dangling: list[object] = []
+    for relation in repos.relation.relations.get(family_id, []):
+        if isinstance(relation, ParentOf):
+            ids = {relation.parent_id, relation.child_id}
+        else:
+            ids = {relation.a_id, relation.b_id}
+        if ids - alive:
+            dangling.append(relation)
+    return dangling
 
 
 # --- Критерий 22: удаление человека ---------------------------------------
@@ -266,6 +296,204 @@ async def test_delete_person_removes_spouse_edge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_person_rejects_own_record_and_writes_nothing() -> None:
+    """Владелец не может удалить собственную запись.
+
+    Иначе семья осталась бы без владельца: передача владения вне скоупа
+    первой версии (SPEC 7), а `families.owner_account_id` продолжал бы
+    указывать на аккаунт, у которого в этой семье больше нет записи.
+    """
+    repos = build_repos()
+    await _create_family(repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15))
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _delete_person(repos, acting_account_id=owner_account.id, person_id=owner_person.id)
+
+    assert _snapshot(repos) == before
+
+
+@pytest.mark.asyncio
+async def test_delete_person_removes_placeholder_left_without_children() -> None:
+    """Заглушка без детей удаляется вместе с последним ребёнком.
+
+    Заглушка существует только чтобы связать братьев и сестёр между собой
+    (SPEC 4.1). У Ольги и Светы общая заглушка-родитель; когда удалены обе,
+    держать её больше не за что — иначе в дереве остался бы невидимый узел
+    без единого ребра.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    wife = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Ольга",
+        gender=Gender.FEMALE,
+        birth_date=date(1991, 5, 5),
+        relation_kind=RelationKind.WIFE,
+        relative_to_person_id=owner_person.id,
+    )
+    # Родители Ольги неизвестны, поэтому её сестра цепляется к заглушке
+    # (SPEC 4.1) — у заглушки оказывается ровно двое детей.
+    wife_sister = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Света",
+        gender=Gender.FEMALE,
+        birth_date=date(1993, 7, 7),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=wife.id,
+    )
+    [placeholder] = [p for p in repos.person.people.values() if p.is_placeholder]
+    assert {
+        r.child_id
+        for r in repos.relation.relations[family.id]
+        if isinstance(r, ParentOf) and r.parent_id == placeholder.id
+    } == {wife.id, wife_sister.id}
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife.id)
+    # После первого удаления у заглушки ещё есть Света — она должна остаться.
+    assert placeholder.id in repos.person.people
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife_sister.id)
+
+    assert placeholder.id not in repos.person.people
+    assert _dangling_relations(repos, family.id) == []
+    # Владелец не задет: удаление жены и её сестры его записи не касается.
+    assert owner_person.id in repos.person.people
+
+
+@pytest.mark.asyncio
+async def test_delete_placeholder_with_spouse_leaves_no_dangling_edges() -> None:
+    """Удаление заглушки снимает и её ребро супруга, а не только рёбра к детям.
+
+    Заглушка «несёт рёбра только к детям» — инвариант её создания, но не
+    инвариант жизни узла: `add_person` не запрещает выбрать заглушку как
+    `relative_to_person_id`, поэтому супруг у неё появиться может. Если при
+    удалении такое ребро не снять, оно укажет на несуществующего человека —
+    в SQLite (PRAGMA foreign_keys=ON, SPEC 6.2) это либо отказ удаления, либо
+    каскад, а обход дерева споткнётся о призрачный узел.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    wife = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Ольга",
+        gender=Gender.FEMALE,
+        birth_date=date(1991, 5, 5),
+        relation_kind=RelationKind.WIFE,
+        relative_to_person_id=owner_person.id,
+    )
+    wife_sister = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Света",
+        gender=Gender.FEMALE,
+        birth_date=date(1993, 7, 7),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=wife.id,
+    )
+    [placeholder] = [p for p in repos.person.people.values() if p.is_placeholder]
+    await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Иван",
+        gender=Gender.MALE,
+        birth_date=date(1950, 1, 1),
+        relation_kind=RelationKind.HUSBAND,
+        relative_to_person_id=placeholder.id,
+    )
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife_sister.id)
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife.id)
+
+    assert placeholder.id not in repos.person.people
+    assert _dangling_relations(repos, family.id) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_person_cascades_through_stacked_placeholders() -> None:
+    """Заглушка над заглушкой тоже удаляется, когда лишилась последнего ребёнка.
+
+    Удаление человека с детьми превращает его в заглушку (SPEC 4.3), а его
+    брат, добавленный после этого, заводит над ним вторую заглушку. Когда
+    у нижней заглушки не остаётся детей, она удаляется — и тем самым может
+    лишить детей верхнюю, поэтому проверка идёт вверх по цепочке, а не на
+    один шаг.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    son = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Сын",
+        gender=Gender.MALE,
+        birth_date=date(2010, 1, 1),
+        relation_kind=RelationKind.SON,
+        relative_to_person_id=owner_person.id,
+    )
+    grandson = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Внук",
+        gender=Gender.MALE,
+        birth_date=date(2030, 1, 1),
+        relation_kind=RelationKind.SON,
+        relative_to_person_id=son.id,
+    )
+    # Сын становится заглушкой: у него есть ребёнок.
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=son.id)
+    assert repos.person.people[son.id].is_placeholder is True
+    # Брат сына цепляется к заглушке-сыну, заводя над ней вторую заглушку.
+    brother = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Брат",
+        gender=Gender.MALE,
+        birth_date=date(2012, 1, 1),
+        relation_kind=RelationKind.BROTHER,
+        relative_to_person_id=son.id,
+    )
+    upper = [p for p in repos.person.people.values() if p.is_placeholder and p.id not in (son.id,)]
+    assert len(upper) == 1
+    [upper_placeholder] = upper
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=grandson.id)
+    # Заглушка-сын осталась без детей и должна исчезнуть, не оставив рёбер.
+    assert son.id not in repos.person.people
+    assert _dangling_relations(repos, family.id) == []
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=brother.id)
+
+    assert upper_placeholder.id not in repos.person.people
+    assert _dangling_relations(repos, family.id) == []
+    assert set(repos.person.people) == {owner_person.id}
+
+
+@pytest.mark.asyncio
 async def test_delete_person_rejects_non_owner_and_writes_nothing() -> None:
     repos = build_repos()
     await _create_family(repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15))
@@ -291,6 +519,38 @@ async def test_delete_person_rejects_non_owner_and_writes_nothing() -> None:
 
 
 # --- Критерии 24-26: приглашения --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invite_code_fits_telegram_start_parameter() -> None:
+    """SPEC 5.7: код едет параметром start, отсюда алфавит [A-Za-z0-9_-] и длина.
+
+    22 символа этого алфавита — 128 бит энтропии, и это заметно меньше
+    предельных 64 символов параметра start. Коды двух приглашений не совпадают.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    codes: set[str] = set()
+    for index, name in enumerate(("Марина", "Света")):
+        person = await _add_person(
+            repos,
+            acting_account_id=owner_account.id,
+            family_id=family.id,
+            name=name,
+            gender=Gender.FEMALE,
+            birth_date=date(1992, 4, 4 + index),
+            relation_kind=RelationKind.SISTER,
+            relative_to_person_id=owner_person.id,
+        )
+        invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=person.id)
+        assert re.fullmatch(r"[A-Za-z0-9_-]{22}", invite.code), invite.code
+        codes.add(invite.code)
+
+    assert len(codes) == 2
 
 
 @pytest.mark.asyncio
@@ -809,6 +1069,146 @@ async def test_set_override_replaces_offsets_for_single_account() -> None:
     ]
     assert {r.offset_days for r in owner_reminders} == {2}
     assert {r.offset_days for r in marina_reminders} == set(DEFAULT_OFFSETS_DAYS)
+
+
+@pytest.mark.asyncio
+async def test_timezone_change_rebuilds_in_every_family_of_account() -> None:
+    """Критерий приёмки 6: пояс перестраивает напоминания во всех семьях аккаунта.
+
+    Настройки лежат в аккаунте, а не в семье (SPEC 2.1, 5.6), поэтому смена
+    пояса обязана задеть и семью, которая для аккаунта не текущая.
+    """
+    repos = build_repos()
+    own_family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [anton_person] = repos.person.people.values()
+    [anton_account] = repos.account.accounts.values()
+    father = await _add_person(
+        repos,
+        acting_account_id=anton_account.id,
+        family_id=own_family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=anton_person.id,
+    )
+
+    # Вторая семья, где Антон — приглашённый участник, а не владелец.
+    other_family = await _create_family(
+        repos, telegram_user_id=222, name="Борис", birth_date=date(1985, 8, 20)
+    )
+    [boris_person] = [p for p in repos.person.people.values() if p.family_id == other_family.id]
+    [boris_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 222]
+    anton_record = await _add_person(
+        repos,
+        acting_account_id=boris_account.id,
+        family_id=other_family.id,
+        name="Антон",
+        gender=Gender.MALE,
+        birth_date=date(1990, 6, 15),
+        relation_kind=RelationKind.BROTHER,
+        relative_to_person_id=boris_person.id,
+    )
+    invite = await _issue_invite(
+        repos, acting_account_id=boris_account.id, person_id=anton_record.id
+    )
+    await _accept_invite(repos, code=invite.code, telegram_user_id=111)
+    assert anton_account.current_family_id == own_family.id
+
+    [father_event] = [e for e in repos.event.events.values() if e.person_id == father.id]
+    [boris_event] = [e for e in repos.event.events.values() if e.person_id == boris_person.id]
+    anton_ids = {anton_person.id, anton_record.id}
+    before = {
+        r.event_id
+        for r in repos.reminder.reminders
+        if r.person_id in anton_ids and r.status == ReminderStatus.PENDING
+    }
+    assert before == {father_event.id, boris_event.id}
+
+    await update_account_settings(
+        anton_account.id,
+        "Asia/Tokyo",
+        DEFAULT_OFFSETS_DAYS,
+        time(9, 0),
+        repos.account,
+        repos.membership,
+        repos.event,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+    )
+
+    anton_reminders = [r for r in repos.reminder.reminders if r.person_id in anton_ids]
+    # 09:00 в Токио — 00:00 UTC, в обеих семьях сразу.
+    assert {r.event_id for r in anton_reminders} == {father_event.id, boris_event.id}
+    assert all(r.due_at_utc.hour == 0 and r.due_at_utc.minute == 0 for r in anton_reminders)
+    # Напоминания Бориса остались по его поясу: чужие настройки не задеты.
+    boris_reminders = [r for r in repos.reminder.reminders if r.person_id == boris_person.id]
+    assert boris_reminders
+    assert all(r.due_at_utc.hour == 6 for r in boris_reminders)
+
+
+@pytest.mark.asyncio
+async def test_timezone_change_keeps_sent_and_rebuilds_pending() -> None:
+    """Критерий приёмки 6: смена пояса перестраивает pending, отправленное не трогает.
+
+    Отправленную строку нельзя ни удалить, ни перезаписать (SPEC 5.6:
+    «прошлое не переписывается»), и новой вместо неё тоже не появляется —
+    её отбрасывает уникальный индекс по
+    (event_id, person_id, occurrence_date, offset_days) (SPEC 5.3).
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    father = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=owner_person.id,
+    )
+    [father_event] = [e for e in repos.event.events.values() if e.person_id == father.id]
+    assert {r.offset_days for r in repos.reminder.reminders} == set(DEFAULT_OFFSETS_DAYS)
+
+    # 09:00 в Москве — это 06:00 UTC; отмечаем строку «за 7 дней» отправленной.
+    [sent] = [r for r in repos.reminder.reminders if r.offset_days == 7]
+    assert sent.due_at_utc == datetime(2027, 2, 22, 6, 0, tzinfo=UTC)
+    sent.status = ReminderStatus.SENT
+    sent.sent_at = datetime(2027, 2, 22, 6, 0, 30, tzinfo=UTC)
+
+    await update_account_settings(
+        owner_account.id,
+        "Asia/Tokyo",
+        DEFAULT_OFFSETS_DAYS,
+        time(9, 0),
+        repos.account,
+        repos.membership,
+        repos.event,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+    )
+
+    by_offset = {r.offset_days: r for r in repos.reminder.reminders}
+    assert len(repos.reminder.reminders) == len(DEFAULT_OFFSETS_DAYS)
+    # Отправленная строка осталась ровно как была, дубля рядом с ней нет.
+    assert by_offset[7].status == ReminderStatus.SENT
+    assert by_offset[7].due_at_utc == datetime(2027, 2, 22, 6, 0, tzinfo=UTC)
+    assert by_offset[7].sent_at == datetime(2027, 2, 22, 6, 0, 30, tzinfo=UTC)
+    # Остальные пересобраны по новому поясу: 09:00 в Токио — это 00:00 UTC.
+    assert by_offset[1].status == ReminderStatus.PENDING
+    assert by_offset[1].due_at_utc == datetime(2027, 2, 28, 0, 0, tzinfo=UTC)
+    assert by_offset[0].status == ReminderStatus.PENDING
+    assert by_offset[0].due_at_utc == datetime(2027, 3, 1, 0, 0, tzinfo=UTC)
+    assert all(r.event_id == father_event.id for r in repos.reminder.reminders)
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import secrets
-import string
 from dataclasses import replace
 from datetime import date, time, timedelta
 
@@ -44,9 +43,10 @@ from kinday.core.reminders import MISFIRE_GRACE, materialize_for_event
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
 
-# SPEC 5.7: алфавит ограничен параметром start в t.me-ссылке, 22 символа — 128 бит энтропии.
-INVITE_CODE_ALPHABET = string.ascii_letters + string.digits + "_-"
-INVITE_CODE_LENGTH = 22
+# SPEC 5.7: код едет параметром start в t.me-ссылке, поэтому ограничен алфавитом
+# [A-Za-z0-9_-] и 64 символами. token_urlsafe(16) даёт ровно этот алфавит и 22
+# символа — 128 бит энтропии.
+INVITE_CODE_BYTES = 16
 INVITE_TTL = timedelta(days=7)
 
 # Заведомо невозможный id человека: репозитории выдают только положительные id.
@@ -422,11 +422,21 @@ async def delete_person(
     или супруг, удаляются в обоих случаях — SPEC называет заглушкой узел без
     имени, пола и даты рождения, несущий рёбра только к детям (см.
     create_placeholder_parent), поэтому у заглушки не может остаться ни
-    родителей, ни супруга. Отклоняет действие, если acting_account не владелец
-    семьи (family_repo).
+    родителей, ни супруга. Заглушка-родитель, у которой после удаления не
+    осталось ни одного ребёнка, удаляется вместе с ним
+    (_drop_childless_placeholders).
+
+    Отклоняет действие, если acting_account не владелец семьи (family_repo), и
+    если владелец удаляет собственную запись: передача владения семьёй вне
+    скоупа первой версии (SPEC 7), поэтому families.owner_account_id указывал
+    бы на аккаунт, у которого в этой семье больше нет записи человека.
     """
     person = await person_repo.get(person_id)
     await _require_owner(family_repo, person.family_id, acting_account_id)
+
+    own = await membership_repo.get_by_account_and_family(acting_account_id, person.family_id)
+    if own is not None and own.person_id == person_id:
+        raise ValueError(f"Аккаунт {acting_account_id} не может удалить собственную запись")
 
     for event in await event_repo.list_by_person(person_id):
         await reminder_repo.delete_all_for_event(event.id)
@@ -436,6 +446,9 @@ async def delete_person(
 
     relations = await relation_repo.list_by_family(person.family_id)
     has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
+    parent_ids = {
+        r.parent_id for r in relations if isinstance(r, ParentOf) and r.child_id == person_id
+    }
     for relation in relations:
         if (isinstance(relation, ParentOf) and relation.child_id == person_id) or (
             isinstance(relation, SpouseOf) and person_id in (relation.a_id, relation.b_id)
@@ -451,9 +464,59 @@ async def delete_person(
     else:
         await person_repo.delete(person_id)
 
+    await _drop_childless_placeholders(parent_ids, person.family_id, person_repo, relation_repo)
+
+
+async def _drop_childless_placeholders(
+    candidate_ids: set[int],
+    family_id: int,
+    person_repo: PersonRepo,
+    relation_repo: RelationRepo,
+) -> None:
+    """Удаляет заглушки из `candidate_ids`, у которых больше не осталось детей.
+
+    Заглушка нужна только чтобы связать братьев и сестёр между собой (SPEC 4.1);
+    без детей она не несёт смысла, а показать её пользователю нельзя.
+
+    Перед удалением снимаются все рёбра заглушки, а не только рёбра к детям.
+    Рассчитывать на то, что у заглушки есть лишь рёбра вниз, нельзя: так она
+    только создаётся (create_placeholder_parent), но `add_person` не запрещает
+    выбрать заглушку как `relative_to_person_id`, поэтому у неё может
+    появиться супруг, а добавленный ей брат заведёт над ней вторую заглушку.
+    Висячее ребро на удалённого человека в SQLite при `PRAGMA foreign_keys=ON`
+    (SPEC 6.2) либо не даст удалить строку, либо утащит каскадом чужие рёбра.
+
+    Поэтому и обход идёт вверх по цепочке: снятое ребро могло быть последним
+    ребёнком заглушки этажом выше. `candidate_ids` перебирается как очередь,
+    каждый узел рассматривается один раз.
+    """
+    queue = set(candidate_ids)
+    deleted: set[int] = set()
+    while queue:
+        candidate_id = queue.pop()
+        if candidate_id in deleted:
+            continue
+        candidate = await person_repo.get(candidate_id)
+        if not candidate.is_placeholder:
+            continue
+
+        relations = await relation_repo.list_by_family(family_id)
+        if any(isinstance(r, ParentOf) and r.parent_id == candidate_id for r in relations):
+            continue
+
+        for relation in relations:
+            if isinstance(relation, ParentOf) and relation.child_id == candidate_id:
+                queue.add(relation.parent_id)
+                await relation_repo.remove(family_id, relation)
+            elif isinstance(relation, SpouseOf) and candidate_id in (relation.a_id, relation.b_id):
+                await relation_repo.remove(family_id, relation)
+
+        await person_repo.delete(candidate_id)
+        deleted.add(candidate_id)
+
 
 def _generate_invite_code() -> str:
-    return "".join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(INVITE_CODE_LENGTH))
+    return secrets.token_urlsafe(INVITE_CODE_BYTES)
 
 
 async def issue_invite(
