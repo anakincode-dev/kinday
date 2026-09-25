@@ -12,6 +12,7 @@ from kinday.core.models import (
     BIRTHDAY_EVENT_TITLE,
     Account,
     Event,
+    EventKind,
     Family,
     Gender,
     Invite,
@@ -37,6 +38,12 @@ from kinday.core.reminders import materialize_for_event
 
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
+
+# Заведомо невозможный id человека: репозитории выдают только положительные id.
+# Используется, чтобы прогнать attach_parent «вхолостую» и убедиться, что она
+# не бросит исключение, прежде чем создавать нового человека в хранилище —
+# см. комментарий в add_person.
+_DRY_RUN_PERSON_ID = -1
 
 
 class NotFamilyOwner(Exception):
@@ -79,7 +86,14 @@ async def _materialize_birthday(
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Event:
-    """Заводит ежегодное событие «День рождения» и сразу материализует по нему напоминания."""
+    """Заводит ежегодное событие «День рождения» и сразу материализует по нему напоминания.
+
+    kind=BIRTHDAY, а не совпадение title со строкой — по нему materialize_for_event
+    узнаёт единственное исключение из напоминаний всем (SPEC 3.4). У человека не
+    может появиться второго такого события: эта функция вызывается ровно один
+    раз для только что созданного person (в create_family и add_person), у
+    которого до этого момента вообще не было ни одного события.
+    """
     event = await event_repo.create(
         Event(
             id=0,
@@ -88,6 +102,7 @@ async def _materialize_birthday(
             title=BIRTHDAY_EVENT_TITLE,
             date=birth_date,
             is_recurring_yearly=True,
+            kind=EventKind.BIRTHDAY,
         )
     )
     recipients = await _recipients(family_id, membership_repo, account_repo)
@@ -196,11 +211,12 @@ async def add_person(
     выбранному человеку (SPEC 4.1, критерий приёмки 20). В остальных случаях
     параметр не имеет значения и должен быть None.
 
-    Если attach_parent бросает SiblingsQuestionRequired или отклоняет
-    (третий родитель — ValueError), add_person удаляет уже созданную запись
-    нового человека и пробрасывает исключение без изменений в хранилище —
-    вызывающий код (бот) должен переспросить пользователя и повторить вызов
-    с явным also_parent_of_siblings, либо сообщить об отказе.
+    Если attach_parent бросает SiblingsQuestionRequired (нужен ответ про
+    братьев и сестёр) или отклоняет (третий родитель — ValueError), в
+    хранилище не остаётся никаких следов вызова: ни новый человек, ни рёбра,
+    ни событие не записываются — вызывающий код (бот) должен переспросить
+    пользователя и повторить вызов с явным also_parent_of_siblings, либо
+    сообщить об отказе.
 
     Напоминания по новому дню рождения материализуются сразу же, не дожидаясь
     суточного задания (SPEC 3.1, критерий приёмки 14). Отклоняет действие,
@@ -219,24 +235,31 @@ async def add_person(
 
     match relation_kind:
         case RelationKind.FATHER | RelationKind.MOTHER:
+            # attach_parent может бросить SiblingsQuestionRequired (нужен ответ
+            # пользователя) или ValueError (третий родитель) — тогда в хранилище
+            # не должно остаться ни человека, ни рёбер. Поэтому сначала прогоняем
+            # attach_parent "вхолостую" с заведомо невозможным id нового родителя:
+            # исключения не зависят от его значения, оно попадает только в уже
+            # готовые рёбра результата (parent_id каждого добавленного ParentOf).
+            # Человека создаём и id подставляем в рёбра только после того, как
+            # убедились, что attach_parent не откажет.
+            change = attach_parent(
+                relative_to_person_id,
+                _DRY_RUN_PERSON_ID,
+                parent_relations,
+                also_parent_of_siblings,
+                people,
+            )
             new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
-            try:
-                change = attach_parent(
-                    relative_to_person_id,
-                    new_person.id,
-                    parent_relations,
-                    also_parent_of_siblings,
-                    people,
-                )
-            except Exception:
-                await person_repo.delete(new_person.id)
-                raise
             for edge in change.removed:
                 await relation_repo.remove(family_id, edge)
             if change.removed_placeholder_id is not None:
                 await person_repo.delete(change.removed_placeholder_id)
             for edge in change.added:
-                await relation_repo.add(family_id, edge)
+                assert edge.parent_id == _DRY_RUN_PERSON_ID
+                await relation_repo.add(
+                    family_id, ParentOf(parent_id=new_person.id, child_id=edge.child_id)
+                )
 
         case RelationKind.SON | RelationKind.DAUGHTER:
             new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
@@ -392,6 +415,7 @@ async def add_event(
             title=title,
             date=event_date,
             is_recurring_yearly=is_recurring_yearly,
+            kind=EventKind.CUSTOM,
         )
     )
     recipients = await _recipients(family_id, membership_repo, account_repo)
