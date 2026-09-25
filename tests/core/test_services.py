@@ -243,11 +243,20 @@ async def test_add_person_birthday_event_has_birthday_kind() -> None:
 
 
 @pytest.mark.asyncio
-async def test_add_person_reminder_skips_disabled_delivery_and_event_hero() -> None:
-    """Критерий 14 подробно: напоминание о новом событии строится только
+async def test_add_person_reminder_skips_disabled_delivery_recipient() -> None:
+    """Критерий 14 подробно: напоминание о новом дне рождения не строится
 
-    участникам с delivery_enabled, и не строится самому герою события (тут —
-    самому новому человеку, критерий 15).
+    участнику с delivery_enabled=False. Исключение героя события из
+    получателей (критерий 15) здесь не проверить содержательно: только что
+    созданный add_person человек ещё не привязан ни к какому аккаунту, у него
+    нет Membership, и он не попал бы в получатели в принципе, будь у
+    materialize_for_event вообще какое-либо исключение или нет. Само
+    исключение проверяется там, где герой события действительно уже состоит
+    в семье на момент материализации — в create_family (владелец — и герой
+    своего дня рождения, и участник семьи сразу), см.
+    test_create_family_creates_owner_person_and_membership_without_self_reminder,
+    и на уровне чистой функции в
+    test_materialize_for_event_builds_reminders_and_skips_self.
     """
     repos = build_repos()
     family = await _create_family(
@@ -294,7 +303,6 @@ async def test_add_person_reminder_skips_disabled_delivery_and_event_hero() -> N
     }
     assert recipient_ids == {owner_person.id}
     assert blocked_person.id not in recipient_ids
-    assert father.id not in recipient_ids
 
 
 @pytest.mark.asyncio
