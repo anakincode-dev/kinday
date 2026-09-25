@@ -1,4 +1,5 @@
 {
+  "language": "russian",
   "hooks": {
     "PostToolUse": [
       {
