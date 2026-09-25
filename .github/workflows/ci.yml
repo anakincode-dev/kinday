@@ -40,5 +40,8 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Type check
+        run: uv run ty check
+
       - name: Test
-        run: uv run pytest --cov=femevmen --cov-report=term-missing
+        run: uv run pytest --cov=kinday --cov-report=term-missing

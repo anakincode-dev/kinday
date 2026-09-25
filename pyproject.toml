@@ -1,7 +1,7 @@
 [project]
-name = "femevmen"
+name = "kinday"
 version = "0.1.0"
-description = "femevmen"
+description = "Сервис семейных напоминаний поверх генеалогического дерева"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
@@ -11,6 +11,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.6",
+    "ty>=0.0.1a0",
 ]
 
 [build-system]
@@ -18,7 +19,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/femevmen"]
+packages = ["src/kinday"]
 
 [tool.ruff]
 line-length = 100
@@ -36,6 +37,8 @@ select = [
     "SIM", # flake8-simplify
     "RUF", # ruff-specific
 ]
+# Проект целиком на русском (см. CLAUDE.md): кириллица не "неоднозначные символы".
+ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
