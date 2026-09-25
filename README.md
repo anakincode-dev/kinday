@@ -9,6 +9,7 @@ Telegram-бот семейных напоминаний: хранит генеа
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # если uv ещё не установлен
 uv sync                                           # зависимости
+git config core.hooksPath .githooks               # включить проверки перед коммитом
 cp .env.example .env && $EDITOR .env              # заполнить BOT_TOKEN
 uv run python -m kinday                           # старт бота и планировщика
 ```

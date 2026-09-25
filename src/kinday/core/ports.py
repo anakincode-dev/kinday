@@ -8,7 +8,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
-from kinday.core.models import Account, Event, Family, Invite, Person, Reminder
+from kinday.core.models import (
+    Account,
+    Event,
+    Family,
+    Invite,
+    Person,
+    Relation,
+    Reminder,
+    ReminderOverride,
+)
 
 
 class RecipientBlocked(Exception):
@@ -38,6 +47,26 @@ class ReminderRepo(Protocol):
     async def mark_failed(self, reminder_id: int, at: datetime) -> None: ...
     async def release(self, reminder_id: int) -> None: ...
 
+    async def add_many(self, reminders: list[Reminder]) -> None:
+        """Вставляет пачкой. Дубли по уникальному индексу
+
+        (event_id, person_id, occurrence_date, offset_days) молча игнорируются
+        (см. SPEC 5.3) — повторная материализация не создаёт дублей.
+        """
+        ...
+
+    async def delete_future_pending_for_event(self, event_id: int, after: datetime) -> None:
+        """Удаляет будущие pending-строки по событию перед перематериализацией (SPEC 5.6)."""
+        ...
+
+    async def delete_future_pending_for_person(self, person_id: int, after: datetime) -> None:
+        """Удаляет будущие pending-строки по человеку перед перематериализацией (SPEC 5.6)."""
+        ...
+
+    async def fail_all_sending(self) -> None:
+        """При старте сервиса переводит все строки sending в failed (SPEC 5.5)."""
+        ...
+
 
 class FamilyRepo(Protocol):
     async def get(self, family_id: int) -> Family: ...
@@ -47,7 +76,9 @@ class FamilyRepo(Protocol):
 class PersonRepo(Protocol):
     async def get(self, person_id: int) -> Person: ...
     async def create(self, person: Person) -> Person: ...
+    async def update(self, person: Person) -> Person: ...
     async def delete(self, person_id: int) -> None: ...
+    async def list_by_family(self, family_id: int) -> list[Person]: ...
 
 
 class AccountRepo(Protocol):
@@ -59,6 +90,18 @@ class AccountRepo(Protocol):
 class EventRepo(Protocol):
     async def get(self, event_id: int) -> Event: ...
     async def create(self, event: Event) -> Event: ...
+
+
+class RelationRepo(Protocol):
+    async def list_by_family(self, family_id: int) -> list[Relation]: ...
+    async def add(self, family_id: int, relation: Relation) -> None: ...
+    async def remove(self, family_id: int, relation: Relation) -> None: ...
+
+
+class ReminderOverrideRepo(Protocol):
+    async def get(self, account_id: int, event_id: int) -> ReminderOverride | None: ...
+    async def set(self, override: ReminderOverride) -> None: ...
+    async def revoke(self, account_id: int, event_id: int) -> None: ...
 
 
 class InviteRepo(Protocol):

@@ -28,3 +28,15 @@ class SqliteReminderRepo:
 
     async def release(self, reminder_id: int) -> None:
         raise NotImplementedError
+
+    async def add_many(self, reminders: list[Reminder]) -> None:
+        raise NotImplementedError
+
+    async def delete_future_pending_for_event(self, event_id: int, after: datetime) -> None:
+        raise NotImplementedError
+
+    async def delete_future_pending_for_person(self, person_id: int, after: datetime) -> None:
+        raise NotImplementedError
+
+    async def fail_all_sending(self) -> None:
+        raise NotImplementedError

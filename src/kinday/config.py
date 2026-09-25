@@ -24,6 +24,6 @@ class Settings:
                 "BOT_TOKEN не задан. Укажи его в переменных окружения "
                 "(см. .env.example) перед запуском."
             )
-        database_path = os.environ.get("DATABASE_PATH", "kinday.sqlite3")
+        database_path = os.environ.get("DATABASE_PATH", "data/kinday.sqlite3")
         log_level = os.environ.get("LOG_LEVEL", "INFO")
         return cls(bot_token=bot_token, database_path=database_path, log_level=log_level)
