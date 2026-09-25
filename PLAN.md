@@ -38,7 +38,7 @@
 Готово: перечисленные тесты проходят, `core` по-прежнему ничего не знает про
 внешние слои.
 
-## Этап 2a. Ядро: базовые рёбра родства
+## Этап 2a. Ядро: базовые рёбра родства (готово)
 
 - `core/relations.py`: `add_parent`, `add_child`, `add_spouse`, `add_sibling`,
   `create_placeholder_parent`, `merge_placeholder_into`. Ограничение на двух

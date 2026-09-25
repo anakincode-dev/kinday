@@ -30,39 +30,80 @@ class RelationKind(Enum):
     SISTER = "sister"
 
 
+MAX_PARENTS = 2
+
+
+def _parent_ids(person_id: int, relations: list[ParentOf]) -> list[int]:
+    return [r.parent_id for r in relations if r.child_id == person_id]
+
+
+def _check_parent_slot_free(person_id: int, relations: list[ParentOf]) -> None:
+    if len(_parent_ids(person_id, relations)) >= MAX_PARENTS:
+        raise ValueError(f"У человека {person_id} уже есть двое родителей")
+
+
 def add_parent(person_id: int, new_parent_id: int, relations: list[ParentOf]) -> ParentOf:
     """Записать «отец»/«мать» как parent_of(new_parent_id, person_id).
 
-    Отклоняет попытку добавить третьего родителя (см. SPEC 4.1).
+    Отклоняет попытку добавить третьего родителя (см. SPEC 4.1). Если среди
+    уже известных родителей person_id есть заглушка, вызывающий код должен
+    сначала слить её через merge_placeholder_into, а не занимать этой функцией
+    её место — иначе заглушка останется висеть рядом с настоящим родителем
+    вместо слияния с ним.
     """
-    raise NotImplementedError
+    _check_parent_slot_free(person_id, relations)
+    return ParentOf(parent_id=new_parent_id, child_id=person_id)
 
 
 def add_child(person_id: int, new_child_id: int, relations: list[ParentOf]) -> ParentOf:
-    """Записать «сын»/«дочь» как parent_of(person_id, new_child_id)."""
-    raise NotImplementedError
+    """Записать «сын»/«дочь» как parent_of(person_id, new_child_id).
+
+    Отклоняет попытку добавить третьего родителя новому ребёнку (см. SPEC 4.1).
+    Как и add_parent, не заменяет собой merge_placeholder_into: если у
+    new_child_id уже есть заглушка среди родителей, её нужно сливать отдельно.
+    """
+    _check_parent_slot_free(new_child_id, relations)
+    return ParentOf(parent_id=person_id, child_id=new_child_id)
 
 
 def add_spouse(person_id: int, new_spouse_id: int) -> SpouseOf:
     """Записать «супруг»/«супруга» как spouse_of(person_id, new_spouse_id)."""
-    raise NotImplementedError
+    return SpouseOf(a_id=person_id, b_id=new_spouse_id)
 
 
 def add_sibling(person_id: int, new_sibling_id: int, relations: list[ParentOf]) -> list[ParentOf]:
     """Записать «брат»/«сестра»: parent_of(P, new_sibling_id) для каждого известного
 
     родителя `P` человека `person_id`. Если родителей ещё нет, вызывающий код
-    должен сперва завести заглушку через create_placeholder_parent.
+    должен сперва завести заглушку через create_placeholder_parent — эта
+    функция вернёт пустой список, если в `relations` для person_id нет ни
+    одного ребра parent_of.
     """
-    raise NotImplementedError
+    return [
+        ParentOf(parent_id=parent_id, child_id=new_sibling_id)
+        for parent_id in _parent_ids(person_id, relations)
+    ]
 
 
-def create_placeholder_parent(family_id: int, placeholder_id: int, child_id: int) -> Person:
-    """Скрытый узел-заглушка: без имени, даты рождения и пола, несёт рёбра к детям.
+def create_placeholder_parent(
+    family_id: int, placeholder_id: int, child_id: int
+) -> tuple[Person, ParentOf]:
+    """Скрытый узел-заглушка: без имени, даты рождения и пола, несёт ребро к первому ребёнку.
 
     `placeholder_id` выделяет вызывающий код (репозиторий), это чистая функция.
+    Второй ребёнок присоединяется позже через add_sibling, который найдёт
+    заглушку среди родителей первого ребёнка в `relations`.
     """
-    raise NotImplementedError
+    placeholder = Person(
+        id=placeholder_id,
+        family_id=family_id,
+        name=None,
+        gender=None,
+        birth_date=None,
+        is_placeholder=True,
+    )
+    edge = ParentOf(parent_id=placeholder_id, child_id=child_id)
+    return placeholder, edge
 
 
 def merge_placeholder_into(
@@ -73,7 +114,11 @@ def merge_placeholder_into(
     Возвращает рёбра заглушки, переписанные на real_parent_id; сама заглушка
     удаляется вызывающим кодом.
     """
-    raise NotImplementedError
+    return [
+        ParentOf(parent_id=real_parent_id, child_id=r.child_id)
+        for r in relations
+        if r.parent_id == placeholder_id
+    ]
 
 
 def infer_relation_text(
