@@ -10,7 +10,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from kinday.core.models import Account, Event, Family, Membership, Person, Relation, Reminder
+from kinday.core.models import (
+    Account,
+    Event,
+    Family,
+    Invite,
+    Membership,
+    Person,
+    Relation,
+    Reminder,
+    ReminderOverride,
+    ReminderStatus,
+)
 
 
 class FixedClock:
@@ -129,6 +140,19 @@ class FakeEventRepo:
         self.events[event.id] = event
         return event
 
+    async def update(self, event: Event) -> Event:
+        self.events[event.id] = event
+        return event
+
+    async def delete(self, event_id: int) -> None:
+        del self.events[event_id]
+
+    async def list_by_family(self, family_id: int) -> list[Event]:
+        return [e for e in self.events.values() if e.family_id == family_id]
+
+    async def list_by_person(self, person_id: int) -> list[Event]:
+        return [e for e in self.events.values() if e.person_id == person_id]
+
 
 @dataclass
 class FakeRelationRepo:
@@ -167,13 +191,87 @@ class FakeReminderRepo:
         self.reminders.extend(reminders)
 
     async def delete_future_pending_for_event(self, event_id: int, after: datetime) -> None:
-        raise NotImplementedError
+        self.reminders = [
+            r
+            for r in self.reminders
+            if not (
+                r.event_id == event_id
+                and r.status == ReminderStatus.PENDING
+                and r.due_at_utc >= after
+            )
+        ]
 
     async def delete_future_pending_for_person(self, person_id: int, after: datetime) -> None:
-        raise NotImplementedError
+        self.reminders = [
+            r
+            for r in self.reminders
+            if not (
+                r.person_id == person_id
+                and r.status == ReminderStatus.PENDING
+                and r.due_at_utc >= after
+            )
+        ]
+
+    async def delete_future_pending_for_event_and_person(
+        self, event_id: int, person_id: int, after: datetime
+    ) -> None:
+        self.reminders = [
+            r
+            for r in self.reminders
+            if not (
+                r.event_id == event_id
+                and r.person_id == person_id
+                and r.status == ReminderStatus.PENDING
+                and r.due_at_utc >= after
+            )
+        ]
+
+    async def delete_all_for_event(self, event_id: int) -> None:
+        self.reminders = [r for r in self.reminders if r.event_id != event_id]
+
+    async def delete_all_for_person(self, person_id: int) -> None:
+        self.reminders = [r for r in self.reminders if r.person_id != person_id]
 
     async def fail_all_sending(self) -> None:
         raise NotImplementedError
+
+
+@dataclass
+class FakeInviteRepo:
+    invites: dict[int, Invite] = field(default_factory=dict)
+    _next_id: int = 1
+
+    async def get(self, invite_id: int) -> Invite:
+        return self.invites[invite_id]
+
+    async def get_by_code(self, code: str) -> Invite | None:
+        return next((i for i in self.invites.values() if i.code == code), None)
+
+    async def create(self, invite: Invite) -> Invite:
+        invite.id = self._next_id
+        self._next_id += 1
+        self.invites[invite.id] = invite
+        return invite
+
+    async def revoke(self, invite_id: int, at: datetime) -> None:
+        self.invites[invite_id].revoked_at = at
+
+    async def mark_used(self, invite_id: int, at: datetime) -> None:
+        self.invites[invite_id].used_at = at
+
+
+@dataclass
+class FakeReminderOverrideRepo:
+    overrides: dict[tuple[int, int], ReminderOverride] = field(default_factory=dict)
+
+    async def get(self, account_id: int, event_id: int) -> ReminderOverride | None:
+        return self.overrides.get((account_id, event_id))
+
+    async def set(self, override: ReminderOverride) -> None:
+        self.overrides[(override.account_id, override.event_id)] = override
+
+    async def revoke(self, account_id: int, event_id: int) -> None:
+        self.overrides.pop((account_id, event_id), None)
 
 
 @dataclass
@@ -185,6 +283,8 @@ class Repos:
     event: FakeEventRepo
     relation: FakeRelationRepo
     reminder: FakeReminderRepo
+    invite: FakeInviteRepo
+    override: FakeReminderOverrideRepo
 
 
 def build_repos() -> Repos:
@@ -196,4 +296,6 @@ def build_repos() -> Repos:
         event=FakeEventRepo(),
         relation=FakeRelationRepo(),
         reminder=FakeReminderRepo(),
+        invite=FakeInviteRepo(),
+        override=FakeReminderOverrideRepo(),
     )
