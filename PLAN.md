@@ -11,7 +11,7 @@
 
 Готово: `uv run pytest`, `uv run ruff check .`, `uv run ty check` зелёные.
 
-## Этап 1. Ядро: recurrence и reminders
+## Этап 1. Ядро: recurrence и reminders (готово)
 
 Самая сложная логика предметной области, без Telegram и без SQLite.
 

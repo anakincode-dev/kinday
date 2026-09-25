@@ -1,0 +1,138 @@
+"""Тесты due_at_utc и materialize_for_event: моменты отправки и материализация."""
+
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from kinday.core.models import Account, Event, Membership, ReminderStatus
+from kinday.core.reminders import due_at_utc, materialize_for_event
+
+
+class FixedClock:
+    """Простая подмена Clock с зафиксированным now(), без реальных часов."""
+
+    def __init__(self, now: datetime) -> None:
+        self._now = now
+
+    def now(self) -> datetime:
+        return self._now
+
+
+def _account(account_id: int, tz: str, offsets: tuple[int, ...] = (7, 1, 0)) -> Account:
+    return Account(
+        id=account_id,
+        telegram_user_id=account_id,
+        current_family_id=1,
+        timezone=tz,
+        offsets_days=offsets,
+        time_of_day=time(9, 0),
+        chat_id=account_id,
+    )
+
+
+def test_due_at_utc_same_wall_clock_time_in_different_zones() -> None:
+    """Критерий приёмки 5: два пояса, оба момента 09:00 по своему времени, но разные UTC."""
+    moscow = _account(1, "Europe/Moscow")
+    tokyo = _account(2, "Asia/Tokyo")
+    occurrence = date(2027, 3, 1)
+
+    moscow_due = due_at_utc(occurrence, 7, moscow)
+    tokyo_due = due_at_utc(occurrence, 7, tokyo)
+
+    assert moscow_due != tokyo_due
+    assert moscow_due.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None) == datetime(
+        2027, 2, 22, 9, 0
+    )
+    assert tokyo_due.astimezone(ZoneInfo("Asia/Tokyo")).replace(tzinfo=None) == datetime(
+        2027, 2, 22, 9, 0
+    )
+
+
+def test_due_at_utc_shifts_forward_through_dst_gap() -> None:
+    """Перевод часов вперёд: 2024-03-10 02:30 в America/New_York не существует -> 03:00."""
+    account = _account(1, "America/New_York", offsets=(0,))
+    account.time_of_day = time(2, 30)
+    occurrence = date(2024, 3, 10)
+
+    due = due_at_utc(occurrence, 0, account)
+
+    local = due.astimezone(ZoneInfo("America/New_York"))
+    assert local.replace(tzinfo=None) == datetime(2024, 3, 10, 3, 0)
+
+
+def test_materialize_for_event_builds_reminders_and_skips_self() -> None:
+    """Критерий приёмки 15: о своём дне рождения человеку напоминание не строится."""
+    clock = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
+    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 3, 1))
+    anton_membership = Membership(account_id=1, family_id=1, person_id=1)
+    petr_membership = Membership(account_id=2, family_id=1, person_id=2)
+
+    reminders = materialize_for_event(
+        event,
+        [
+            (anton_membership, _account(1, "Europe/Moscow")),
+            (petr_membership, _account(2, "Europe/Moscow")),
+        ],
+        clock,
+    )
+
+    assert {r.person_id for r in reminders} == {1}
+    assert len(reminders) == 3
+    assert {r.offset_days for r in reminders} == {7, 1, 0}
+    assert all(r.occurrence_date == date(2027, 3, 1) for r in reminders)
+    assert all(r.status == ReminderStatus.PENDING for r in reminders)
+    assert all(r.event_id == 100 for r in reminders)
+
+
+def test_materialize_for_event_horizon_excludes_far_future_occurrence() -> None:
+    """Горизонт 400 дней: следующая годовщина за пределами горизонта не строится."""
+    clock = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
+    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 3, 1))
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+
+    reminders = materialize_for_event(
+        event, [(membership, _account(1, "Europe/Moscow", offsets=(0,)))], clock
+    )
+
+    assert {r.occurrence_date for r in reminders} == {date(2027, 3, 1)}
+
+
+def test_due_at_utc_recomputes_on_timezone_change() -> None:
+    """Критерий приёмки 6: смена пояса участника меняет момент отправки."""
+    occurrence = date(2027, 3, 1)
+    before = due_at_utc(occurrence, 7, _account(1, "Europe/Moscow"))
+    after = due_at_utc(occurrence, 7, _account(1, "Asia/Tokyo"))
+
+    assert before != after
+
+
+def test_due_at_utc_recomputes_on_event_date_change() -> None:
+    """Критерий приёмки 7: смена даты события меняет момент отправки."""
+    account = _account(1, "Europe/Moscow")
+    before = due_at_utc(date(2027, 3, 1), 7, account)
+    after = due_at_utc(date(2027, 3, 10), 7, account)
+
+    assert before != after
+    assert after - before == timedelta(days=9)
+
+
+def test_materialize_for_event_only_builds_future_occurrences() -> None:
+    """Критерии 6, 7: перематериализация строит только будущее, прошлое не переписывается.
+
+    materialize_for_event — чистая функция без состояния, поэтому "не трогать
+    прошлое" здесь означает, что она никогда не порождает напоминания на уже
+    прошедшую дату события: пересчёт при смене пояса/даты/смещений (SPEC 5.6)
+    заменяет только future pending-строки, а сама материализация не может
+    случайно создать напоминание в прошлом.
+    """
+    clock = FixedClock(datetime(2027, 3, 15, tzinfo=UTC))
+    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 3, 1))
+    membership = Membership(account_id=1, family_id=1, person_id=1)
+
+    reminders = materialize_for_event(
+        event, [(membership, _account(1, "Europe/Moscow", offsets=(0,)))], clock
+    )
+
+    assert all(r.occurrence_date >= clock.now().date() for r in reminders)
+    assert date(2027, 3, 1) not in {r.occurrence_date for r in reminders}
