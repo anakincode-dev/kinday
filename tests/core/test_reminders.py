@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from kinday.core.models import Account, Event, Membership, ReminderStatus
+from kinday.core.models import Account, Event, EventKind, Membership, ReminderStatus
 from kinday.core.reminders import due_at_utc, materialize_for_event
 
 
@@ -64,7 +64,14 @@ def test_due_at_utc_shifts_forward_through_dst_gap() -> None:
 def test_materialize_for_event_builds_reminders_and_skips_self() -> None:
     """Критерий приёмки 15: о своём дне рождения человеку напоминание не строится."""
     clock = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
-    event = Event(id=100, family_id=1, person_id=2, title="День рождения", date=date(1980, 3, 1))
+    event = Event(
+        id=100,
+        family_id=1,
+        person_id=2,
+        title="День рождения",
+        date=date(1980, 3, 1),
+        kind=EventKind.BIRTHDAY,
+    )
     anton_membership = Membership(account_id=1, family_id=1, person_id=1)
     petr_membership = Membership(account_id=2, family_id=1, person_id=2)
 
@@ -83,6 +90,31 @@ def test_materialize_for_event_builds_reminders_and_skips_self() -> None:
     assert all(r.occurrence_date == date(2027, 3, 1) for r in reminders)
     assert all(r.status == ReminderStatus.PENDING for r in reminders)
     assert all(r.event_id == 100 for r in reminders)
+
+
+def test_materialize_for_event_does_not_skip_self_for_non_birthday_event() -> None:
+    """SPEC 3.4: исключение из напоминаний всем — только собственный день рождения.
+
+    kind по умолчанию CUSTOM: герой не-днерожденческого события (например,
+    выпускной) получает напоминание о нём наравне со всеми, в отличие от дня
+    рождения (см. test_materialize_for_event_builds_reminders_and_skips_self).
+    """
+    clock = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
+    event = Event(
+        id=100,
+        family_id=1,
+        person_id=2,
+        title="Выпускной",
+        date=date(2027, 6, 3),
+        is_recurring_yearly=False,
+    )
+    marina_membership = Membership(account_id=2, family_id=1, person_id=2)
+
+    reminders = materialize_for_event(
+        event, [(marina_membership, _account(2, "Europe/Moscow", offsets=(0,)))], clock
+    )
+
+    assert {r.person_id for r in reminders} == {2}
 
 
 def test_materialize_for_event_horizon_excludes_far_future_occurrence() -> None:

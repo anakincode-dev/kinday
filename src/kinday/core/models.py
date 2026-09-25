@@ -20,6 +20,19 @@ class ReminderStatus(Enum):
     FAILED = "failed"
 
 
+class EventKind(Enum):
+    """Различает день рождения от произвольного события (SPEC 3.4, 4.2).
+
+    День рождения — единственное исключение из напоминаний всем участникам
+    семьи: о нём человеку не напоминают, о прочих событиях, где он сам герой,
+    напоминают наравне со всеми. Определяется этим полем, а не названием
+    события — оно свободный текст и может совпадать случайно.
+    """
+
+    BIRTHDAY = "birthday"
+    CUSTOM = "custom"
+
+
 @dataclass(slots=True)
 class Family:
     id: int
@@ -98,11 +111,12 @@ class Event:
     title: str
     date: date
     is_recurring_yearly: bool = True
+    kind: EventKind = EventKind.CUSTOM
 
     @property
     def is_birthday(self) -> bool:
         """SPEC 3.4: единственное исключение из напоминаний всем — собственный день рождения."""
-        return self.title == BIRTHDAY_EVENT_TITLE
+        return self.kind == EventKind.BIRTHDAY
 
 
 @dataclass(slots=True)
