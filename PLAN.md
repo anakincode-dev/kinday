@@ -64,7 +64,7 @@
 
 Готово: критерии 17, 23 проходят на чистых данных в памяти.
 
-## Этап 3a. Ядро: сценарии создания
+## Этап 3a. Ядро: сценарии создания (готово)
 
 `create_family`, `add_person`, `add_event` поверх `relations.py`,
 `reminders.py`, `texts.py` и портов-протоколов (`FamilyRepo`, `PersonRepo`,

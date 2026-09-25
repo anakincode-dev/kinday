@@ -87,6 +87,9 @@ class SpouseOf:
 Relation = ParentOf | SpouseOf
 
 
+BIRTHDAY_EVENT_TITLE = "День рождения"
+
+
 @dataclass(slots=True)
 class Event:
     id: int
@@ -95,6 +98,11 @@ class Event:
     title: str
     date: date
     is_recurring_yearly: bool = True
+
+    @property
+    def is_birthday(self) -> bool:
+        """SPEC 3.4: единственное исключение из напоминаний всем — собственный день рождения."""
+        return self.title == BIRTHDAY_EVENT_TITLE
 
 
 @dataclass(slots=True)
