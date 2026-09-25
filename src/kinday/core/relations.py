@@ -10,12 +10,30 @@
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
 from kinday.core.models import ParentOf, Person, Relation, SpouseOf
+from kinday.core.texts import relation_word
 
 MAX_RELATION_DEPTH = 3
+
+# Категория родства по шагам кратчайшего пути от получателя к герою события.
+# UP — шаг к родителю, DOWN — шаг к ребёнку, SPOUSE — шаг к супругу.
+_RELATION_BY_PATH: dict[tuple[str, ...], str] = {
+    ("UP",): "parent",
+    ("DOWN",): "child",
+    ("SPOUSE",): "spouse",
+    ("UP", "UP"): "grandparent",
+    ("DOWN", "DOWN"): "grandchild",
+    ("UP", "DOWN"): "sibling",
+    ("UP", "UP", "UP"): "grandparent_parent",
+    ("DOWN", "DOWN", "DOWN"): "grandchild_child",
+    ("UP", "UP", "DOWN"): "parent_sibling",
+    ("UP", "DOWN", "DOWN"): "sibling_child",
+}
 
 
 class RelationKind(Enum):
@@ -251,16 +269,77 @@ def attach_parent(
     return ParentChange(added=added, removed=[], removed_placeholder_id=None)
 
 
+def _relation_adjacency(
+    relations: Sequence[Relation],
+) -> tuple[dict[int, list[int]], dict[int, list[int]], dict[int, list[int]]]:
+    """Списки соседей по родителям, детям и супругам для обхода в infer_relation_text."""
+    parents: dict[int, list[int]] = {}
+    children: dict[int, list[int]] = {}
+    spouses: dict[int, list[int]] = {}
+    for relation in relations:
+        if isinstance(relation, ParentOf):
+            parents.setdefault(relation.child_id, []).append(relation.parent_id)
+            children.setdefault(relation.parent_id, []).append(relation.child_id)
+        else:
+            spouses.setdefault(relation.a_id, []).append(relation.b_id)
+            spouses.setdefault(relation.b_id, []).append(relation.a_id)
+    return parents, children, spouses
+
+
+def _shortest_relation_path(
+    from_person_id: int, to_person_id: int, relations: Sequence[Relation]
+) -> tuple[str, ...] | None:
+    """BFS до MAX_RELATION_DEPTH шагов, гарантирует кратчайший путь по числу рёбер."""
+    parents, children, spouses = _relation_adjacency(relations)
+    queue: deque[tuple[int, tuple[str, ...]]] = deque([(from_person_id, ())])
+    visited = {from_person_id}
+    while queue:
+        node, path = queue.popleft()
+        if len(path) >= MAX_RELATION_DEPTH:
+            continue
+        neighbours = (
+            [(parent_id, "UP") for parent_id in parents.get(node, [])]
+            + [(child_id, "DOWN") for child_id in children.get(node, [])]
+            + [(spouse_id, "SPOUSE") for spouse_id in spouses.get(node, [])]
+        )
+        for neighbour_id, step in neighbours:
+            if neighbour_id in visited:
+                continue
+            new_path = (*path, step)
+            if neighbour_id == to_person_id:
+                return new_path
+            visited.add(neighbour_id)
+            queue.append((neighbour_id, new_path))
+    return None
+
+
 def infer_relation_text(
     from_person_id: int,
     to_person_id: int,
     people: dict[int, Person],
-    relations: list[Relation],
+    relations: Sequence[Relation],
 ) -> str:
     """Родство от получателя к герою события, обход графа `relations` глубиной не больше трёх шагов.
 
-    `people` даёт пол для формулировки («ваш брат» vs «ваша сестра»).
-    Если родство не выводится или лежит дальше MAX_RELATION_DEPTH, вернуть пустую строку.
-    Заглушки (Person.is_placeholder) в текст не попадают.
+    `people` даёт пол героя события для формулировки («вашего брата» vs
+    «вашей сестры»). Если родство не выводится или лежит дальше
+    MAX_RELATION_DEPTH, возвращает пустую строку. Заглушки (Person.is_placeholder)
+    сами по себе героями события не бывают (см. models.py), но участвуют в обходе
+    как промежуточные узлы — так родство братьев и сестёр выводится и через
+    общую заглушку неизвестного родителя (критерий приёмки 18).
     """
-    raise NotImplementedError
+    if from_person_id == to_person_id:
+        return ""
+    to_person = people.get(to_person_id)
+    if to_person is None or to_person.is_placeholder:
+        return ""
+
+    path = _shortest_relation_path(from_person_id, to_person_id, relations)
+    if path is None:
+        return ""
+
+    category = _RELATION_BY_PATH.get(path)
+    if category is None:
+        return ""
+
+    return relation_word(category, to_person.gender)
