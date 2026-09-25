@@ -1,14 +1,15 @@
-"""Тесты базовых рёбер родства: add_parent, add_child, add_spouse, add_sibling,
+"""Тесты базовых рёбер родства и вывода родства текстом.
 
-attach_parent, create_placeholder_parent, merge_placeholder_into. Только рёбра
-в памяти, без хранилища и без вывода родства текстом (см. тест этапа 2b).
+add_parent, add_child, add_spouse, add_sibling, attach_parent,
+create_placeholder_parent, merge_placeholder_into, infer_relation_text.
+Только рёбра в памяти, без хранилища.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from kinday.core.models import ParentOf, Person, SpouseOf
+from kinday.core.models import Gender, ParentOf, Person, SpouseOf
 from kinday.core.relations import (
     ParentChange,
     SiblingAttachment,
@@ -19,6 +20,7 @@ from kinday.core.relations import (
     add_spouse,
     attach_parent,
     create_placeholder_parent,
+    infer_relation_text,
     merge_placeholder_into,
 )
 
@@ -34,12 +36,14 @@ HALF_SIBLING_OTHER_PARENT_ID = 7
 NEW_CHILD_ID = 8
 
 
-def _person(person_id: int, *, is_placeholder: bool = False) -> Person:
+def _person(
+    person_id: int, *, is_placeholder: bool = False, gender: Gender | None = None
+) -> Person:
     return Person(
         id=person_id,
         family_id=FAMILY_ID,
         name=None if is_placeholder else f"person-{person_id}",
-        gender=None,
+        gender=gender,
         birth_date=None,
         is_placeholder=is_placeholder,
     )
@@ -344,3 +348,145 @@ def test_attach_parent_rejects_third_parent() -> None:
 
     with pytest.raises(ValueError, match="родител"):
         attach_parent(ANTON_ID, STRANGER_ID, relations, also_parent_of_siblings=None, people=people)
+
+
+def test_infer_relation_text_sibling_returns_sister_word_for_female() -> None:
+    """Критерий приёмки 17: отец известен, вывод родства даёт «сестра» с учётом пола."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        MARINA_ID: _person(MARINA_ID, gender=Gender.FEMALE),
+    }
+
+    text = infer_relation_text(ANTON_ID, MARINA_ID, people, relations)
+
+    assert "сестры" in text
+
+
+def test_infer_relation_text_sibling_returns_brother_word_in_reverse_direction() -> None:
+    """Критерий приёмки 17: то же родство в обратную сторону даёт «брат»."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        MARINA_ID: _person(MARINA_ID, gender=Gender.FEMALE),
+    }
+
+    text = infer_relation_text(MARINA_ID, ANTON_ID, people, relations)
+
+    assert "брата" in text
+
+
+def test_infer_relation_text_sibling_through_placeholder_parent() -> None:
+    """Критерий приёмки 18: родители неизвестны, общая заглушка всё равно даёт родство."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
+    ]
+    people = {
+        PLACEHOLDER_ID: _person(PLACEHOLDER_ID, is_placeholder=True),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        MARINA_ID: _person(MARINA_ID, gender=Gender.FEMALE),
+    }
+
+    text = infer_relation_text(ANTON_ID, MARINA_ID, people, relations)
+
+    assert "сестры" in text
+
+
+def test_infer_relation_text_parent_and_grandparent() -> None:
+    """Родство на глубину 1 и 2 шага: отец и дедушка (пример из SPEC 4.2)."""
+    grandfather_id = 9
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=grandfather_id, child_id=FATHER_ID),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID, gender=Gender.MALE),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        grandfather_id: _person(grandfather_id, gender=Gender.MALE),
+    }
+
+    assert "отца" in infer_relation_text(ANTON_ID, FATHER_ID, people, relations)
+    assert "дедушки" in infer_relation_text(ANTON_ID, grandfather_id, people, relations)
+
+
+def test_infer_relation_text_uncle_at_exactly_three_steps() -> None:
+    """Ровно три шага (родитель-родитель-ребёнок) — дядя, родство ещё выводится."""
+    grandfather_id = 9
+    uncle_id = 10
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=grandfather_id, child_id=FATHER_ID),
+        ParentOf(parent_id=grandfather_id, child_id=uncle_id),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID, gender=Gender.MALE),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        grandfather_id: _person(grandfather_id, gender=Gender.MALE),
+        uncle_id: _person(uncle_id, gender=Gender.MALE),
+    }
+
+    text = infer_relation_text(ANTON_ID, uncle_id, people, relations)
+
+    assert "дяди" in text
+
+
+def test_infer_relation_text_beyond_three_steps_returns_empty() -> None:
+    """Критерий приёмки 23: кузен дальше трёх шагов — родство не выводится."""
+    grandfather_id = 9
+    uncle_id = 10
+    cousin_id = 11
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=grandfather_id, child_id=FATHER_ID),
+        ParentOf(parent_id=grandfather_id, child_id=uncle_id),
+        ParentOf(parent_id=uncle_id, child_id=cousin_id),
+    ]
+    people = {
+        FATHER_ID: _person(FATHER_ID, gender=Gender.MALE),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        grandfather_id: _person(grandfather_id, gender=Gender.MALE),
+        uncle_id: _person(uncle_id, gender=Gender.MALE),
+        cousin_id: _person(cousin_id, gender=Gender.MALE),
+    }
+
+    assert infer_relation_text(ANTON_ID, cousin_id, people, relations) == ""
+
+
+def test_infer_relation_text_no_path_returns_empty() -> None:
+    """Родство не выводится вовсе (нет пути в графе) — пустая строка."""
+    people = {
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        STRANGER_ID: _person(STRANGER_ID, gender=Gender.MALE),
+    }
+
+    assert infer_relation_text(ANTON_ID, STRANGER_ID, people, relations=[]) == ""
+
+
+def test_infer_relation_text_same_person_returns_empty() -> None:
+    people = {ANTON_ID: _person(ANTON_ID, gender=Gender.MALE)}
+
+    assert infer_relation_text(ANTON_ID, ANTON_ID, people, relations=[]) == ""
+
+
+def test_infer_relation_text_placeholder_as_hero_returns_empty() -> None:
+    """Заглушка не порождает событий и не может быть героем события (SPEC 4.1)."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
+    ]
+    people = {
+        PLACEHOLDER_ID: _person(PLACEHOLDER_ID, is_placeholder=True),
+        ANTON_ID: _person(ANTON_ID, gender=Gender.MALE),
+        MARINA_ID: _person(MARINA_ID, gender=Gender.FEMALE),
+    }
+
+    assert infer_relation_text(ANTON_ID, PLACEHOLDER_ID, people, relations) == ""
