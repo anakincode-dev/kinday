@@ -58,6 +58,9 @@ def materialize_for_event(
     получателя в семье события, Account — его настройки напоминаний.
     Собственный день рождения человека не порождает напоминание для него
     самого — сравнение идёт по Membership.person_id, а не по Account.id.
+    Это единственное исключение (SPEC 3.4): о прочих событиях, где человек
+    сам герой (например, о своём выпускном), напоминание строится наравне
+    со всеми остальными получателями семьи.
 
     Аккаунты с `delivery_enabled=False` пропускаются (SPEC 5.5, 403 — доставка
     отключена до повторного запуска бота). Даты наступления перебираются
@@ -76,7 +79,7 @@ def materialize_for_event(
 
     reminders: list[Reminder] = []
     for membership, account in recipients:
-        if membership.person_id == event.person_id:
+        if membership.person_id == event.person_id and event.is_birthday:
             continue
         if not account.delivery_enabled:
             continue
