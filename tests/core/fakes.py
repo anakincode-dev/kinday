@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 from kinday.core.models import (
     Account,
@@ -22,6 +22,16 @@ from kinday.core.models import (
     ReminderOverride,
     ReminderStatus,
 )
+
+
+def _unique_key(reminder: Reminder) -> tuple[int, int, date, int]:
+    """Ключ уникального индекса напоминаний из SPEC 5.3."""
+    return (
+        reminder.event_id,
+        reminder.person_id,
+        reminder.occurrence_date,
+        reminder.offset_days,
+    )
 
 
 class FixedClock:
@@ -188,7 +198,18 @@ class FakeReminderRepo:
         raise NotImplementedError
 
     async def add_many(self, reminders: list[Reminder]) -> None:
-        self.reminders.extend(reminders)
+        """Эмулирует уникальный индекс SPEC 5.3, а не просто расширяет список.
+
+        В SQLite вставка идёт через ON CONFLICT DO NOTHING по
+        (event_id, person_id, occurrence_date, offset_days) — независимо от
+        статуса уже лежащей строки. Без этой эмуляции фейк расходился бы
+        с настоящим хранилищем ровно там, где перематериализация задевает
+        отправленную строку: в базе новая строка была бы отброшена, а в фейке
+        появился бы дубль.
+        """
+        for reminder in reminders:
+            if not any(_unique_key(r) == _unique_key(reminder) for r in self.reminders):
+                self.reminders.append(reminder)
 
     async def delete_future_pending_for_event(self, event_id: int, after: datetime) -> None:
         self.reminders = [
