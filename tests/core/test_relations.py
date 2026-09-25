@@ -1,19 +1,23 @@
 """Тесты базовых рёбер родства: add_parent, add_child, add_spouse, add_sibling,
 
-create_placeholder_parent, merge_placeholder_into. Только рёбра в памяти,
-без хранилища и без вывода родства текстом (см. test этапа 2b).
+attach_parent, create_placeholder_parent, merge_placeholder_into. Только рёбра
+в памяти, без хранилища и без вывода родства текстом (см. тест этапа 2b).
 """
 
 from __future__ import annotations
 
 import pytest
 
-from kinday.core.models import ParentOf, SpouseOf
+from kinday.core.models import ParentOf, Person, SpouseOf
 from kinday.core.relations import (
+    ParentChange,
+    SiblingAttachment,
+    SiblingsQuestionRequired,
     add_child,
     add_parent,
     add_sibling,
     add_spouse,
+    attach_parent,
     create_placeholder_parent,
     merge_placeholder_into,
 )
@@ -25,6 +29,20 @@ MARINA_ID = 3
 MOTHER_ID = 4
 STRANGER_ID = 5
 PLACEHOLDER_ID = 100
+HALF_SIBLING_ID = 6
+HALF_SIBLING_OTHER_PARENT_ID = 7
+NEW_CHILD_ID = 8
+
+
+def _person(person_id: int, *, is_placeholder: bool = False) -> Person:
+    return Person(
+        id=person_id,
+        family_id=FAMILY_ID,
+        name=None if is_placeholder else f"person-{person_id}",
+        gender=None,
+        birth_date=None,
+        is_placeholder=is_placeholder,
+    )
 
 
 def test_add_parent_creates_edge_from_new_parent_to_person() -> None:
@@ -42,6 +60,11 @@ def test_add_parent_rejects_third_parent() -> None:
         add_parent(ANTON_ID, STRANGER_ID, relations)
 
 
+def test_add_parent_rejects_self_reference() -> None:
+    with pytest.raises(ValueError, match="сам"):
+        add_parent(ANTON_ID, ANTON_ID, relations=[])
+
+
 def test_add_child_creates_edge_from_person_to_new_child() -> None:
     edge = add_child(FATHER_ID, ANTON_ID, relations=[])
     assert edge == ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)
@@ -56,16 +79,28 @@ def test_add_child_rejects_third_parent_for_new_child() -> None:
         add_child(STRANGER_ID, ANTON_ID, relations)
 
 
+def test_add_child_rejects_self_reference() -> None:
+    with pytest.raises(ValueError, match="ребён"):
+        add_child(ANTON_ID, ANTON_ID, relations=[])
+
+
 def test_add_spouse_creates_symmetric_edge() -> None:
     edge = add_spouse(FATHER_ID, MOTHER_ID)
     assert edge == SpouseOf(a_id=FATHER_ID, b_id=MOTHER_ID)
 
 
+def test_add_spouse_rejects_self_reference() -> None:
+    with pytest.raises(ValueError, match="сам"):
+        add_spouse(FATHER_ID, FATHER_ID)
+
+
 def test_add_sibling_with_known_parent_creates_edge_from_parent_to_sibling() -> None:
     """Критерий приёмки 17 (часть про ребро): отец уже заведён, добавляем сестру."""
     relations = [ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)]
-    edges = add_sibling(ANTON_ID, MARINA_ID, relations)
-    assert edges == [ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID)]
+    result = add_sibling(ANTON_ID, MARINA_ID, relations)
+    assert result == SiblingAttachment(
+        placeholder=None, edges=[ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID)]
+    )
 
 
 def test_add_sibling_with_two_known_parents_creates_edge_from_each() -> None:
@@ -73,8 +108,9 @@ def test_add_sibling_with_two_known_parents_creates_edge_from_each() -> None:
         ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID),
     ]
-    edges = add_sibling(ANTON_ID, MARINA_ID, relations)
-    assert sorted(edges, key=lambda e: e.parent_id) == [
+    result = add_sibling(ANTON_ID, MARINA_ID, relations)
+    assert result.placeholder is None
+    assert sorted(result.edges, key=lambda e: e.parent_id) == [
         ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
         ParentOf(parent_id=MOTHER_ID, child_id=MARINA_ID),
     ]
@@ -91,18 +127,32 @@ def test_create_placeholder_parent_returns_placeholder_without_identity() -> Non
     assert edge == ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID)
 
 
-def test_add_sibling_without_known_parents_uses_placeholder() -> None:
-    """Критерий приёмки 18: сестра без известных родителей — через заглушку."""
-    placeholder, edge_to_anton = create_placeholder_parent(FAMILY_ID, PLACEHOLDER_ID, ANTON_ID)
-    relations = [edge_to_anton]
+def test_add_sibling_without_known_parents_creates_placeholder_via_core_function() -> None:
+    """Критерий приёмки 18: без родителей add_sibling сама заводит заглушку."""
+    result = add_sibling(
+        ANTON_ID,
+        MARINA_ID,
+        relations=[],
+        family_id=FAMILY_ID,
+        placeholder_id=PLACEHOLDER_ID,
+    )
 
-    sibling_edges = add_sibling(ANTON_ID, MARINA_ID, relations)
+    assert result.placeholder is not None
+    assert result.placeholder.id == PLACEHOLDER_ID
+    assert result.placeholder.is_placeholder is True
+    assert sorted(result.edges, key=lambda e: e.child_id) == [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
+    ]
 
-    assert sibling_edges == [ParentOf(parent_id=placeholder.id, child_id=MARINA_ID)]
+
+def test_add_sibling_without_known_parents_and_without_placeholder_id_raises() -> None:
+    """Раньше add_sibling молча возвращала [] — теперь это ошибка, а не тихий отказ."""
+    with pytest.raises(ValueError, match="родител"):
+        add_sibling(ANTON_ID, MARINA_ID, relations=[])
 
 
 def test_merge_placeholder_into_real_parent_rewrites_edges() -> None:
-    """Критерий приёмки 19: первый настоящий родитель занимает место заглушки."""
     relations = [
         ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
@@ -127,32 +177,170 @@ def test_merge_placeholder_into_ignores_unrelated_edges() -> None:
     assert rewritten == [ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)]
 
 
-def test_second_parent_answer_yes_propagates_to_existing_siblings() -> None:
+def test_attach_parent_with_no_known_parents_creates_single_edge() -> None:
+    result = attach_parent(
+        ANTON_ID, FATHER_ID, relations=[], also_parent_of_siblings=None, people={}
+    )
+    assert result == ParentChange(
+        added=[ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)],
+        removed=[],
+        removed_placeholder_id=None,
+    )
+
+
+def test_attach_parent_rejects_self_reference() -> None:
+    with pytest.raises(ValueError, match="сам"):
+        attach_parent(ANTON_ID, ANTON_ID, relations=[], also_parent_of_siblings=None, people={})
+
+
+def test_attach_parent_merges_placeholder_instead_of_asking_about_siblings() -> None:
+    """Критерий приёмки 19: заглушка сливается через функцию ядра, вопрос про братьев не нужен."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
+    ]
+    people = {PLACEHOLDER_ID: _person(PLACEHOLDER_ID, is_placeholder=True)}
+
+    result = attach_parent(
+        ANTON_ID, FATHER_ID, relations, also_parent_of_siblings=None, people=people
+    )
+
+    assert result.removed_placeholder_id == PLACEHOLDER_ID
+    assert sorted(result.removed, key=lambda e: e.child_id) == [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
+    ]
+    assert sorted(result.added, key=lambda e: e.child_id) == [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+
+
+def test_attach_parent_placeholder_plus_real_parent_does_not_trigger_already_two_rejection() -> (
+    None
+):
+    """Заглушка + настоящий родитель (двое рёбер) — это слияние, а не отказ «уже двое»."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+    ]
+    people = {
+        PLACEHOLDER_ID: _person(PLACEHOLDER_ID, is_placeholder=True),
+        FATHER_ID: _person(FATHER_ID),
+    }
+
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people
+    )
+
+    assert result.removed_placeholder_id == PLACEHOLDER_ID
+    assert result.added == [ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)]
+
+
+def test_attach_parent_single_parent_without_other_children_needs_no_question() -> None:
+    relations = [ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people
+    )
+
+    assert result == ParentChange(
+        added=[ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)],
+        removed=[],
+        removed_placeholder_id=None,
+    )
+
+
+def test_attach_parent_none_with_siblings_raises_siblings_question_required() -> None:
+    """Критерий приёмки 20, часть «спросить»: None при наличии братьев поднимает вопрос."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    with pytest.raises(SiblingsQuestionRequired) as exc_info:
+        attach_parent(ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people)
+
+    assert exc_info.value.sibling_ids == [MARINA_ID]
+
+
+def test_attach_parent_second_parent_via_son_daughter_path_also_asks() -> None:
+    """Тот же путь для «сын/дочь»: вызов attach_parent(new_child_id, person_id, ...)
+
+    тоже поднимает вопрос про братьев, если у ребёнка уже есть родитель с другими детьми.
+    """
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=NEW_CHILD_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    with pytest.raises(SiblingsQuestionRequired) as exc_info:
+        attach_parent(
+            NEW_CHILD_ID, MOTHER_ID, relations, also_parent_of_siblings=None, people=people
+        )
+
+    assert exc_info.value.sibling_ids == [MARINA_ID]
+
+
+def test_attach_parent_answer_yes_propagates_to_existing_siblings() -> None:
     """Критерий приёмки 20, ответ «да»: рёбра протягиваются ко всем детям первого родителя."""
     relations = [
         ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
     ]
-    children_of_first_parent = [ANTON_ID, MARINA_ID]
+    people = {FATHER_ID: _person(FATHER_ID)}
 
-    new_edges = [
-        add_parent(child_id, MOTHER_ID, relations) for child_id in children_of_first_parent
-    ]
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=True, people=people
+    )
 
-    assert sorted(new_edges, key=lambda e: e.child_id) == [
+    assert sorted(result.added, key=lambda e: e.child_id) == [
         ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=MOTHER_ID, child_id=MARINA_ID),
     ]
 
 
-def test_second_parent_answer_no_affects_only_chosen_person() -> None:
+def test_attach_parent_answer_yes_skips_half_sibling_who_already_has_two_parents() -> None:
+    """Ответ «да» при сводном брате с двумя родителями — его пропускаем, не падаем."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=HALF_SIBLING_ID),
+        ParentOf(parent_id=HALF_SIBLING_OTHER_PARENT_ID, child_id=HALF_SIBLING_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID)}
+
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=True, people=people
+    )
+
+    assert result.added == [ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)]
+
+
+def test_attach_parent_answer_no_affects_only_chosen_person() -> None:
     """Критерий приёмки 20, ответ «нет»: ребро только к выбранному человеку."""
     relations = [
         ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
     ]
+    people = {FATHER_ID: _person(FATHER_ID)}
 
-    new_edge = add_parent(ANTON_ID, MOTHER_ID, relations)
+    result = attach_parent(
+        ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=False, people=people
+    )
 
-    assert new_edge == ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)
-    assert ParentOf(parent_id=MOTHER_ID, child_id=MARINA_ID) not in relations
+    assert result.added == [ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID)]
+
+
+def test_attach_parent_rejects_third_parent() -> None:
+    """Критерий приёмки 21 через attach_parent: двое настоящих родителей — отказ."""
+    relations = [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID),
+    ]
+    people = {FATHER_ID: _person(FATHER_ID), MOTHER_ID: _person(MOTHER_ID)}
+
+    with pytest.raises(ValueError, match="родител"):
+        attach_parent(ANTON_ID, STRANGER_ID, relations, also_parent_of_siblings=None, people=people)
