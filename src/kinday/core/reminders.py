@@ -58,17 +58,36 @@ def materialize_for_event(
     получателя в семье события, Account — его настройки напоминаний.
     Собственный день рождения человека не порождает напоминание для него
     самого — сравнение идёт по Membership.person_id, а не по Account.id.
+
+    Аккаунты с `delivery_enabled=False` пропускаются (SPEC 5.5, 403 — доставка
+    отключена до повторного запуска бота). Даты наступления перебираются
+    начиная с "сегодня по UTC минус 1 день", чтобы не упустить наступление,
+    которое по UTC уже "прошло", а по поясу получателя — ещё нет. Из
+    перебранных дат напоминание остаётся, только если due_at_utc не отстаёт от
+    now больше чем на MISFIRE_GRACE и occurrence_date не раньше сегодняшней
+    даты в поясе получателя — ровно то, что тик не пометит missed сразу же.
     """
-    today = clock.now().date()
-    horizon = today + timedelta(days=MATERIALIZATION_HORIZON_DAYS)
-    occurrences = _occurrences_within_horizon(event, today, horizon)
+    now = clock.now()
+    today_utc = now.date()
+    search_start = today_utc - timedelta(days=1)
+    horizon = today_utc + timedelta(days=MATERIALIZATION_HORIZON_DAYS)
+    occurrences = _occurrences_within_horizon(event, search_start, horizon)
+    not_before = now - timedelta(seconds=MISFIRE_GRACE)
 
     reminders: list[Reminder] = []
     for membership, account in recipients:
         if membership.person_id == event.person_id:
             continue
+        if not account.delivery_enabled:
+            continue
+        today_local = now.astimezone(ZoneInfo(account.timezone)).date()
         for occurrence in occurrences:
+            if occurrence < today_local:
+                continue
             for offset in account.offsets_days:
+                due = due_at_utc(occurrence, offset, account)
+                if due < not_before:
+                    continue
                 reminders.append(
                     Reminder(
                         id=0,
@@ -76,7 +95,7 @@ def materialize_for_event(
                         person_id=membership.person_id,
                         offset_days=offset,
                         occurrence_date=occurrence,
-                        due_at_utc=due_at_utc(occurrence, offset, account),
+                        due_at_utc=due,
                     )
                 )
     return reminders

@@ -97,11 +97,15 @@ in-memory реализации в тестах). `add_person` и `add_event` с�
 - `storage/db.py`: `connect` (PRAGMA), `apply_migrations`.
 - `storage/migrations/000N_*.sql`: полная схема из SPEC.md 5.3.
 - `storage/repos.py`: реализации всех протоколов `core/ports.py` поверх
-  `asyncio.to_thread`.
+  `asyncio.to_thread`. Вставка напоминаний в `add_many` идёт через
+  `INSERT ... ON CONFLICT DO NOTHING` по уникальному индексу
+  (`event_id`, `person_id`, `occurrence_date`, `offset_days`).
 
 Тесты гоняют те же сценарии из этапов 1–3, но с реальным SQLite вместо
 in-memory реализаций (общие фикстуры, разные репозитории). Отдельный тест на
 критерий 28: миграции применяются по порядку, повторный старт их не повторяет.
+Отдельный тест на `add_many`: после перематериализации уже отправленное
+напоминание не создаётся заново.
 
 Готово: одинаковые поведенческие тесты проходят и на in-memory, и на SQLite.
 
