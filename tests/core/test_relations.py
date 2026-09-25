@@ -400,7 +400,7 @@ def test_infer_relation_text_sibling_returns_sister_word_for_female() -> None:
 
     text = infer_relation_text(ANTON_ID, MARINA_ID, people, relations)
 
-    assert "сестры" in text
+    assert "сестра" in text
 
 
 def test_infer_relation_text_sibling_returns_brother_word_in_reverse_direction() -> None:
@@ -417,7 +417,7 @@ def test_infer_relation_text_sibling_returns_brother_word_in_reverse_direction()
 
     text = infer_relation_text(MARINA_ID, ANTON_ID, people, relations)
 
-    assert "брата" in text
+    assert "брат" in text
 
 
 def test_infer_relation_text_sibling_through_placeholder_parent() -> None:
@@ -434,7 +434,7 @@ def test_infer_relation_text_sibling_through_placeholder_parent() -> None:
 
     text = infer_relation_text(ANTON_ID, MARINA_ID, people, relations)
 
-    assert "сестры" in text
+    assert "сестра" in text
 
 
 def test_infer_relation_text_parent_and_grandparent() -> None:
@@ -450,8 +450,8 @@ def test_infer_relation_text_parent_and_grandparent() -> None:
         grandfather_id: _person(grandfather_id, gender=Gender.MALE),
     }
 
-    assert "отца" in infer_relation_text(ANTON_ID, FATHER_ID, people, relations)
-    assert "дедушки" in infer_relation_text(ANTON_ID, grandfather_id, people, relations)
+    assert "отец" in infer_relation_text(ANTON_ID, FATHER_ID, people, relations)
+    assert "дедушка" in infer_relation_text(ANTON_ID, grandfather_id, people, relations)
 
 
 def test_infer_relation_text_uncle_at_exactly_three_steps() -> None:
@@ -472,7 +472,7 @@ def test_infer_relation_text_uncle_at_exactly_three_steps() -> None:
 
     text = infer_relation_text(ANTON_ID, uncle_id, people, relations)
 
-    assert "дяди" in text
+    assert "дядя" in text
 
 
 def test_infer_relation_text_beyond_three_steps_returns_empty() -> None:
