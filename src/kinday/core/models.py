@@ -54,6 +54,21 @@ class Account:
 
 
 @dataclass(slots=True)
+class Membership:
+    """Связывает Telegram-аккаунт с записью человека в конкретной семье (SPEC 2.1).
+
+    Не больше одной записи на пару (account_id, family_id) — в каждой семье
+    у аккаунта одна запись человека, — и не больше одной записи на person_id —
+    к одной записи человека привязан только один аккаунт. Человек без
+    аккаунта не имеет строки Membership.
+    """
+
+    account_id: int
+    family_id: int
+    person_id: int
+
+
+@dataclass(slots=True)
 class ParentOf:
     """Направленное ребро parent_of(parent_id, child_id)."""
 

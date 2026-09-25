@@ -229,8 +229,15 @@ class ReminderRepo(Protocol):
 
 ### 5.3 Данные
 
-Таблицы: `families`, `people`, `accounts`, `relations`, `events`,
-`reminder_overrides`, `reminders`, `invites`, `schema_version`.
+Таблицы: `families`, `people`, `accounts`, `memberships`, `relations`,
+`events`, `reminder_overrides`, `reminders`, `invites`, `schema_version`.
+
+`memberships` связывает Telegram-аккаунт с записью человека в конкретной
+семье: `account_id`, `family_id`, `person_id`. Уникальный индекс по паре
+(`account_id`, `family_id`) — в каждой семье у аккаунта одна запись человека
+— и уникальный индекс по `person_id` — к одной записи человека привязан
+только один аккаунт (SPEC 2.1). Человек без аккаунта не имеет строки в
+`memberships`.
 
 Настройки напоминаний принадлежат аккаунту, а не семье, и лежат прямо в
 `accounts`: часовой пояс, набор смещений и время суток одним набором.

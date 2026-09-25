@@ -45,18 +45,27 @@ async def add_person(
     birth_date: date,
     relation_kind: RelationKind,
     relative_to_person_id: int,
-    person_repo: PersonRepo,
-    relation_repo: RelationRepo,
+    also_parent_of_siblings: bool | None,
     account_repo: AccountRepo,
     event_repo: EventRepo,
+    family_repo: FamilyRepo,
+    person_repo: PersonRepo,
+    relation_repo: RelationRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Person:
     """Добавляет человека, переводит связь в базовые рёбра, заводит день рождения.
 
+    `also_parent_of_siblings` имеет смысл только при добавлении второго
+    родителя (relation_kind FATHER/MOTHER человеку, у которого уже есть один
+    известный родитель): «да» — рёбра протягиваются ко всем его братьям и
+    сёстрам, «нет» — только к выбранному человеку (SPEC 4.1, критерий
+    приёмки 20). В остальных случаях параметр не имеет значения и должен
+    быть None.
+
     Напоминания по новому дню рождения материализуются сразу же, не дожидаясь
     суточного задания (SPEC 3.1, критерий приёмки 14). Отклоняет действие,
-    если acting_account не владелец семьи.
+    если acting_account не владелец семьи (family_repo).
     """
     raise NotImplementedError
 
@@ -67,16 +76,17 @@ async def update_person(
     name: str,
     gender: Gender,
     birth_date: date,
-    person_repo: PersonRepo,
-    event_repo: EventRepo,
-    reminder_repo: ReminderRepo,
     account_repo: AccountRepo,
+    event_repo: EventRepo,
+    family_repo: FamilyRepo,
+    person_repo: PersonRepo,
+    reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Person:
     """Правит запись человека. Смена даты рождения перестраивает будущие
 
     напоминания по его дню рождения (SPEC 5.6, критерий приёмки 7).
-    Отклоняет действие, если acting_account не владелец семьи.
+    Отклоняет действие, если acting_account не владелец семьи (family_repo).
     """
     raise NotImplementedError
 
@@ -84,16 +94,18 @@ async def update_person(
 async def delete_person(
     acting_account_id: int,
     person_id: int,
+    event_repo: EventRepo,
+    family_repo: FamilyRepo,
     person_repo: PersonRepo,
     relation_repo: RelationRepo,
-    event_repo: EventRepo,
     reminder_repo: ReminderRepo,
 ) -> None:
     """Удаляет человека физически, либо, если у него есть дети, превращает
 
     его в заглушку: имя, пол, дата рождения и привязка аккаунта стираются,
     события и напоминания удаляются, рёбра к детям остаются (SPEC 4.3,
-    критерий приёмки 22). Отклоняет действие, если acting_account не владелец семьи.
+    критерий приёмки 22). Отклоняет действие, если acting_account не владелец
+    семьи (family_repo).
     """
     raise NotImplementedError
 
@@ -140,15 +152,16 @@ async def add_event(
     person_id: int,
     title: str,
     event_date: date,
-    event_repo: EventRepo,
-    person_repo: PersonRepo,
     account_repo: AccountRepo,
+    event_repo: EventRepo,
+    family_repo: FamilyRepo,
+    person_repo: PersonRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
 ) -> Event:
     """Добавляет событие и сразу материализует по нему напоминания.
 
-    Отклоняет действие, если acting_account не владелец семьи.
+    Отклоняет действие, если acting_account не владелец семьи (family_repo).
     """
     raise NotImplementedError
 
