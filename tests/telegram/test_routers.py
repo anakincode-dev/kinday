@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 
 import pytest
 from tests.core.fakes import FixedClock
@@ -308,14 +308,18 @@ async def test_add_person_rejected_for_participant(
     assert {p.name for p in people if not p.is_placeholder} == {"Антон", "Марина"}
 
 
-async def _issue_invite(telegram: FakeTelegram, *, user_id: int, person_name: str) -> list[str]:
-    listing = await telegram.send("/invite", user_id=user_id)
-    number = next(
+def _number_of(listing: list[str], label: str) -> str:
+    """Номер строки нумерованного списка, в которой встречается `label`."""
+    return next(
         line.split(".", 1)[0].strip()
         for line in listing[-1].splitlines()
-        if person_name in line and "." in line
+        if label in line and "." in line
     )
-    return await telegram.send(number, user_id=user_id)
+
+
+async def _issue_invite(telegram: FakeTelegram, *, user_id: int, person_name: str) -> list[str]:
+    listing = await telegram.send("/invite", user_id=user_id)
+    return await telegram.send(_number_of(listing, person_name), user_id=user_id)
 
 
 def _invite_code(answers: list[str]) -> str:
@@ -448,6 +452,199 @@ async def test_current_family_dialog_switches_family(
     switched = await sqlite_world.account.get_by_telegram_user_id(ANTON)
     assert switched is not None
     assert switched.current_family_id != first_family
+
+
+async def _family_with_father(telegram: FakeTelegram, sqlite_world: World) -> int:
+    """Семья Антона с отцом Петром. Возвращает id семьи."""
+    await _create_family(telegram, user_id=ANTON)
+    await _add_person(
+        telegram,
+        user_id=ANTON,
+        relative_index=1,
+        relation="отец",
+        name="Пётр",
+        gender="мужской",
+        birth="01.03.1980",
+    )
+    account = await sqlite_world.account.get_by_telegram_user_id(ANTON)
+    assert account is not None and account.current_family_id is not None
+    return account.current_family_id
+
+
+async def _add_event(
+    telegram: FakeTelegram,
+    *,
+    user_id: int,
+    person_name: str,
+    title: str,
+    event_date: str,
+    yearly: str = "да",
+) -> list[str]:
+    listing = await telegram.send("/add_event", user_id=user_id)
+    await telegram.send(_number_of(listing, person_name), user_id=user_id)
+    await telegram.send(title, user_id=user_id)
+    await telegram.send(event_date, user_id=user_id)
+    return await telegram.send(yearly, user_id=user_id)
+
+
+@pytest.mark.asyncio
+async def test_add_event_dialog_creates_event_and_reminders(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """SPEC 4.2: у события свои название и дата, напоминания строятся сразу (критерий 14)."""
+    family_id = await _family_with_father(telegram, sqlite_world)
+
+    answers = await _add_event(
+        telegram,
+        user_id=ANTON,
+        person_name="Пётр",
+        title="Годовщина свадьбы",
+        event_date="12.07.2010",
+    )
+
+    assert "годовщина свадьбы" in _answer(answers)
+    [event] = [
+        e for e in await sqlite_world.event.list_by_family(family_id) if e.kind == EventKind.CUSTOM
+    ]
+    assert (event.title, event.date, event.is_recurring_yearly) == (
+        "Годовщина свадьбы",
+        date(2010, 7, 12),
+        True,
+    )
+    # Критерий 14: напоминания появились сразу, без суточного задания.
+    assert {r.event_id for r in await sqlite_world.read_reminders()} >= {event.id}
+
+
+@pytest.mark.asyncio
+async def test_add_event_invalid_date_asks_again(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """Дата вводится как ДД.ММ.ГГГГ: непохожий ответ не доходит до ядра."""
+    family_id = await _family_with_father(telegram, sqlite_world)
+
+    listing = await telegram.send("/add_event", user_id=ANTON)
+    await telegram.send(_number_of(listing, "Пётр"), user_id=ANTON)
+    await telegram.send("Годовщина свадьбы", user_id=ANTON)
+    answers = await telegram.send("12 июля 2010", user_id=ANTON)
+
+    assert "дд.мм.гггг" in _answer(answers)
+    # Диалог не сломался: правильная дата принимается следующим же сообщением.
+    await telegram.send("12.07.2010", user_id=ANTON)
+    assert "годовщина свадьбы" in _answer(await telegram.send("нет", user_id=ANTON))
+    [event] = [
+        e for e in await sqlite_world.event.list_by_family(family_id) if e.kind == EventKind.CUSTOM
+    ]
+    assert event.is_recurring_yearly is False
+
+
+@pytest.mark.asyncio
+async def test_add_event_rejected_for_participant(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """Критерий 27: участник, не владелец, событий не добавляет и получает понятный отказ."""
+    family_id = await _family_with_father(telegram, sqlite_world)
+    code = _invite_code(await _issue_invite(telegram, user_id=ANTON, person_name="Пётр"))
+    await telegram.send(f"/start {code}", user_id=MARINA)
+    await telegram.send("Новосибирск", user_id=MARINA)
+
+    answers = await _add_event(
+        telegram,
+        user_id=MARINA,
+        person_name="Антон",
+        title="Годовщина свадьбы",
+        event_date="12.07.2010",
+    )
+
+    assert "владелец" in _answer(answers)
+    assert [
+        e for e in await sqlite_world.event.list_by_family(family_id) if e.kind == EventKind.CUSTOM
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_settings_dialog_changes_offsets_and_time(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """Критерий 27: участник меняет свои смещения и время суток, будущие строки перестраиваются."""
+    await _family_with_father(telegram, sqlite_world)
+    assert {r.offset_days for r in await sqlite_world.read_reminders()} == {7, 1, 0}
+
+    # Диалог начинается с текущего расписания: менять вслепую незачем.
+    current = await telegram.send("/settings", user_id=ANTON)
+    assert "7, 1, 0" in _answer(current)
+    assert "09:00" in _answer(current)
+
+    await telegram.send("3, 1", user_id=ANTON)
+    answers = await telegram.send("08:30", user_id=ANTON)
+
+    assert "08:30" in _answer(answers)
+    account = await sqlite_world.account.get_by_telegram_user_id(ANTON)
+    assert account is not None
+    assert (account.offsets_days, account.time_of_day) == ((3, 1), time(8, 30))
+    assert {r.offset_days for r in await sqlite_world.read_reminders()} == {3, 1}
+
+
+@pytest.mark.asyncio
+async def test_settings_rejected_offsets_change_nothing(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """Критерий 27: неверный набор смещений отклоняется, ничего не записав.
+
+    Повтор в наборе — доменное правило ядра, роутер его не дублирует: он лишь
+    разбирает числа и переводит отказ сценария в понятный ответ без трейсбека.
+    """
+    await _family_with_father(telegram, sqlite_world)
+
+    await telegram.send("/settings", user_id=ANTON)
+    hint = await telegram.send("через неделю", user_id=ANTON)
+    assert "числ" in _answer(hint)
+
+    await telegram.send("1, 1", user_id=ANTON)
+    answers = await telegram.send("09:00", user_id=ANTON)
+
+    assert "не изменены" in _answer(answers)
+    assert "traceback" not in _answer(answers)
+    account = await sqlite_world.account.get_by_telegram_user_id(ANTON)
+    assert account is not None
+    assert (account.offsets_days, account.time_of_day) == ((7, 1, 0), time(9, 0))
+    assert {r.offset_days for r in await sqlite_world.read_reminders()} == {7, 1, 0}
+
+
+@pytest.mark.asyncio
+async def test_event_override_and_return_to_account_settings(
+    telegram: FakeTelegram, sqlite_world: World
+) -> None:
+    """Критерий 27: своё расписание по одному событию и возврат к настройкам аккаунта."""
+    family_id = await _family_with_father(telegram, sqlite_world)
+    petr = next(p for p in await sqlite_world.person.list_by_family(family_id) if p.name == "Пётр")
+    # Напоминания в базе — только о дне рождения Петра: о своём Антону не
+    # напоминают (критерий 15), а у Петра аккаунта нет.
+    [birthday] = await sqlite_world.event.list_by_person(petr.id)
+
+    listing = await telegram.send("/event_settings", user_id=ANTON)
+    await telegram.send(_number_of(listing, "Пётр"), user_id=ANTON)
+    # Непонятный ответ не выводит из диалога: бот повторяет выбор.
+    assert "свои настройки" in _answer(await telegram.send("может быть", user_id=ANTON))
+    await telegram.send("свои", user_id=ANTON)
+    await telegram.send("2", user_id=ANTON)
+    assert "чч:мм" in _answer(await telegram.send("в семь утра", user_id=ANTON))
+    answers = await telegram.send("07:00", user_id=ANTON)
+
+    assert "07:00" in _answer(answers)
+    account = await sqlite_world.account.get_by_telegram_user_id(ANTON)
+    assert account is not None
+    override = await sqlite_world.override.get(account.id, birthday.id)
+    assert override is not None
+    assert (override.offsets_days, override.time_of_day) == ((2,), time(7, 0))
+    assert {r.offset_days for r in await sqlite_world.read_reminders()} == {2}
+
+    listing = await telegram.send("/event_settings", user_id=ANTON)
+    await telegram.send(_number_of(listing, "Пётр"), user_id=ANTON)
+    answers = await telegram.send("как в настройках", user_id=ANTON)
+
+    assert "настройк" in _answer(answers)
+    assert await sqlite_world.override.get(account.id, birthday.id) is None
+    assert {r.offset_days for r in await sqlite_world.read_reminders()} == {7, 1, 0}
 
 
 @pytest.mark.asyncio
