@@ -57,6 +57,7 @@ async def _create_family(
         repos.event,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -89,6 +90,7 @@ async def _add_person(
         repos.membership,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -116,6 +118,7 @@ async def _add_event(
         repos.membership,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 

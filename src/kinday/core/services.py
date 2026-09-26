@@ -2,6 +2,11 @@
 
 Единственное место, где встречаются модели, порты и остальные модули core.
 Внешние слои (telegram, будущий api) вызывают только эти функции.
+
+Каждый сценарий целиком выполняется внутри переданного `UnitOfWork`: либо все
+его записи видны вместе, либо ни одной (см. docstring протокола в ports.py).
+Поэтому отказ посередине — обычный способ выйти из сценария: откат делает
+единица работы, а ручной уборки записанного в функциях нет.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from kinday.core.ports import (
     RelationRepo,
     ReminderOverrideRepo,
     ReminderRepo,
+    UnitOfWork,
 )
 from kinday.core.relations import RelationKind, add_sibling, add_spouse, attach_parent
 from kinday.core.reminders import MISFIRE_GRACE, materialize_for_event
@@ -176,6 +182,7 @@ async def create_family(
     event_repo: EventRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Family:
     """Создаёт семью, человека-владельца и привязку его Telegram-аккаунта.
 
@@ -187,47 +194,48 @@ async def create_family(
     вызывающего слоя, и молчать о ней, потому что значение не понадобилось,
     значит откладывать отказ до случая, когда оно понадобится.
     """
-    _require_known_timezone(owner_timezone)
+    async with uow:
+        _require_known_timezone(owner_timezone)
 
-    account = await account_repo.get_by_telegram_user_id(owner_telegram_user_id)
-    if account is None:
-        account = await account_repo.save(
-            Account(
-                id=0,
-                telegram_user_id=owner_telegram_user_id,
-                current_family_id=None,
-                timezone=owner_timezone,
-                offsets_days=DEFAULT_OFFSETS_DAYS,
-                time_of_day=DEFAULT_TIME_OF_DAY,
+        account = await account_repo.get_by_telegram_user_id(owner_telegram_user_id)
+        if account is None:
+            account = await account_repo.save(
+                Account(
+                    id=0,
+                    telegram_user_id=owner_telegram_user_id,
+                    current_family_id=None,
+                    timezone=owner_timezone,
+                    offsets_days=DEFAULT_OFFSETS_DAYS,
+                    time_of_day=DEFAULT_TIME_OF_DAY,
+                )
             )
+
+        family = await family_repo.create(
+            Family(id=0, name=f"Семья {owner_name}", owner_account_id=account.id)
+        )
+        owner_person = await person_repo.create(
+            _new_person(family.id, owner_name, owner_gender, owner_birth_date)
+        )
+        await membership_repo.create(
+            Membership(account_id=account.id, family_id=family.id, person_id=owner_person.id)
         )
 
-    family = await family_repo.create(
-        Family(id=0, name=f"Семья {owner_name}", owner_account_id=account.id)
-    )
-    owner_person = await person_repo.create(
-        _new_person(family.id, owner_name, owner_gender, owner_birth_date)
-    )
-    await membership_repo.create(
-        Membership(account_id=account.id, family_id=family.id, person_id=owner_person.id)
-    )
+        if account.current_family_id is None:
+            account.current_family_id = family.id
+            await account_repo.save(account)
 
-    if account.current_family_id is None:
-        account.current_family_id = family.id
-        await account_repo.save(account)
+        await _materialize_birthday(
+            owner_person,
+            owner_birth_date,
+            family.id,
+            event_repo,
+            membership_repo,
+            account_repo,
+            reminder_repo,
+            clock,
+        )
 
-    await _materialize_birthday(
-        owner_person,
-        owner_birth_date,
-        family.id,
-        event_repo,
-        membership_repo,
-        account_repo,
-        reminder_repo,
-        clock,
-    )
-
-    return family
+        return family
 
 
 async def add_person(
@@ -247,6 +255,7 @@ async def add_person(
     membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Person:
     """Добавляет человека, переводит связь в базовые рёбра, заводит день рождения.
 
@@ -281,83 +290,92 @@ async def add_person(
     связать между собой людей из разных семей (SPEC 2: семьи не видят данные
     друг друга).
     """
-    await _require_owner(family_repo, family_id, acting_account_id)
+    async with uow:
+        await _require_owner(family_repo, family_id, acting_account_id)
 
-    all_relations = await relation_repo.list_by_family(family_id)
-    parent_relations = [r for r in all_relations if isinstance(r, ParentOf)]
-    people = {p.id: p for p in await person_repo.list_by_family(family_id)}
-    if relative_to_person_id not in people:
-        raise ValueError(f"Человек {relative_to_person_id} не найден в семье {family_id}")
+        all_relations = await relation_repo.list_by_family(family_id)
+        parent_relations = [r for r in all_relations if isinstance(r, ParentOf)]
+        people = {p.id: p for p in await person_repo.list_by_family(family_id)}
+        if relative_to_person_id not in people:
+            raise ValueError(f"Человек {relative_to_person_id} не найден в семье {family_id}")
 
-    match relation_kind:
-        case RelationKind.FATHER | RelationKind.MOTHER:
-            # attach_parent может бросить SiblingsQuestionRequired (нужен ответ
-            # пользователя) или ValueError (третий родитель) — тогда в хранилище
-            # не должно остаться ни человека, ни рёбер. Поэтому сначала прогоняем
-            # attach_parent "вхолостую" с заведомо невозможным id нового родителя:
-            # исключения не зависят от его значения, оно попадает только в уже
-            # готовые рёбра результата (parent_id каждого добавленного ParentOf).
-            # Человека создаём и id подставляем в рёбра только после того, как
-            # убедились, что attach_parent не откажет.
-            change = attach_parent(
-                relative_to_person_id,
-                _DRY_RUN_PERSON_ID,
-                parent_relations,
-                also_parent_of_siblings,
-                people,
-            )
-            new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
-            for edge in change.removed:
-                await relation_repo.remove(family_id, edge)
-            if change.removed_placeholder_id is not None:
-                await person_repo.delete(change.removed_placeholder_id)
-            for edge in change.added:
-                assert edge.parent_id == _DRY_RUN_PERSON_ID
-                await relation_repo.add(
-                    family_id, ParentOf(parent_id=new_person.id, child_id=edge.child_id)
-                )
-
-        case RelationKind.SON | RelationKind.DAUGHTER:
-            new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
-            change = attach_parent(new_person.id, relative_to_person_id, [], None, {})
-            for edge in change.added:
-                await relation_repo.add(family_id, edge)
-
-        case RelationKind.HUSBAND | RelationKind.WIFE:
-            new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
-            await relation_repo.add(family_id, add_spouse(relative_to_person_id, new_person.id))
-
-        case RelationKind.BROTHER | RelationKind.SISTER:
-            existing_parent_ids = [
-                r.parent_id for r in parent_relations if r.child_id == relative_to_person_id
-            ]
-            new_person = await person_repo.create(_new_person(family_id, name, gender, birth_date))
-            if existing_parent_ids:
-                attachment = add_sibling(relative_to_person_id, new_person.id, parent_relations)
-            else:
-                placeholder = await person_repo.create(_new_placeholder(family_id))
-                attachment = add_sibling(
+        match relation_kind:
+            case RelationKind.FATHER | RelationKind.MOTHER:
+                # attach_parent может бросить SiblingsQuestionRequired (нужен ответ
+                # пользователя) или ValueError (третий родитель) — тогда в хранилище
+                # не должно остаться ни человека, ни рёбер. Поэтому сначала прогоняем
+                # attach_parent "вхолостую" с заведомо невозможным id нового родителя:
+                # исключения не зависят от его значения, оно попадает только в уже
+                # готовые рёбра результата (parent_id каждого добавленного ParentOf).
+                # Человека создаём и id подставляем в рёбра только после того, как
+                # убедились, что attach_parent не откажет.
+                change = attach_parent(
                     relative_to_person_id,
-                    new_person.id,
+                    _DRY_RUN_PERSON_ID,
                     parent_relations,
-                    family_id=family_id,
-                    placeholder_id=placeholder.id,
+                    also_parent_of_siblings,
+                    people,
                 )
-            for edge in attachment.edges:
-                await relation_repo.add(family_id, edge)
+                new_person = await person_repo.create(
+                    _new_person(family_id, name, gender, birth_date)
+                )
+                for edge in change.removed:
+                    await relation_repo.remove(family_id, edge)
+                if change.removed_placeholder_id is not None:
+                    await person_repo.delete(change.removed_placeholder_id)
+                for edge in change.added:
+                    assert edge.parent_id == _DRY_RUN_PERSON_ID
+                    await relation_repo.add(
+                        family_id, ParentOf(parent_id=new_person.id, child_id=edge.child_id)
+                    )
 
-    await _materialize_birthday(
-        new_person,
-        birth_date,
-        family_id,
-        event_repo,
-        membership_repo,
-        account_repo,
-        reminder_repo,
-        clock,
-    )
+            case RelationKind.SON | RelationKind.DAUGHTER:
+                new_person = await person_repo.create(
+                    _new_person(family_id, name, gender, birth_date)
+                )
+                change = attach_parent(new_person.id, relative_to_person_id, [], None, {})
+                for edge in change.added:
+                    await relation_repo.add(family_id, edge)
 
-    return new_person
+            case RelationKind.HUSBAND | RelationKind.WIFE:
+                new_person = await person_repo.create(
+                    _new_person(family_id, name, gender, birth_date)
+                )
+                await relation_repo.add(family_id, add_spouse(relative_to_person_id, new_person.id))
+
+            case RelationKind.BROTHER | RelationKind.SISTER:
+                existing_parent_ids = [
+                    r.parent_id for r in parent_relations if r.child_id == relative_to_person_id
+                ]
+                new_person = await person_repo.create(
+                    _new_person(family_id, name, gender, birth_date)
+                )
+                if existing_parent_ids:
+                    attachment = add_sibling(relative_to_person_id, new_person.id, parent_relations)
+                else:
+                    placeholder = await person_repo.create(_new_placeholder(family_id))
+                    attachment = add_sibling(
+                        relative_to_person_id,
+                        new_person.id,
+                        parent_relations,
+                        family_id=family_id,
+                        placeholder_id=placeholder.id,
+                    )
+                for edge in attachment.edges:
+                    await relation_repo.add(family_id, edge)
+
+        await _materialize_birthday(
+            new_person,
+            birth_date,
+            family_id,
+            event_repo,
+            membership_repo,
+            account_repo,
+            reminder_repo,
+            clock,
+        )
+
+        return new_person
 
 
 async def _rematerialize_event_for_person(
@@ -413,6 +431,7 @@ async def update_person(
     override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Person:
     """Правит запись человека. Смена даты рождения перестраивает будущие
 
@@ -432,31 +451,36 @@ async def update_person(
     и свободный слот второго родителя её дети потеряли бы вместе с ней.
     Настоящий человек заводится на её месте через add_person.
     """
-    person = await person_repo.get(person_id)
-    await _require_owner(family_repo, person.family_id, acting_account_id)
-    if person.is_placeholder:
-        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, не редактируется")
-
-    birth_date_changed = person.birth_date != birth_date
-    person.name = name
-    person.gender = gender
-    person.birth_date = birth_date
-    person = await person_repo.update(person)
-
-    if birth_date_changed:
-        [birthday_event] = [
-            e for e in await event_repo.list_by_person(person_id) if e.kind == EventKind.BIRTHDAY
-        ]
-        birthday_event.date = birth_date
-        birthday_event = await event_repo.update(birthday_event)
-
-        recipients = await _recipients(person.family_id, membership_repo, account_repo)
-        for membership, account in recipients:
-            await _rematerialize_event_for_person(
-                birthday_event, membership, account, override_repo, reminder_repo, clock
+    async with uow:
+        person = await person_repo.get(person_id)
+        await _require_owner(family_repo, person.family_id, acting_account_id)
+        if person.is_placeholder:
+            raise ValueError(
+                f"Запись {person_id} — заглушка неизвестного родителя, не редактируется"
             )
 
-    return person
+        birth_date_changed = person.birth_date != birth_date
+        person.name = name
+        person.gender = gender
+        person.birth_date = birth_date
+        person = await person_repo.update(person)
+
+        if birth_date_changed:
+            [birthday_event] = [
+                e
+                for e in await event_repo.list_by_person(person_id)
+                if e.kind == EventKind.BIRTHDAY
+            ]
+            birthday_event.date = birth_date
+            birthday_event = await event_repo.update(birthday_event)
+
+            recipients = await _recipients(person.family_id, membership_repo, account_repo)
+            for membership, account in recipients:
+                await _rematerialize_event_for_person(
+                    birthday_event, membership, account, override_repo, reminder_repo, clock
+                )
+
+        return person
 
 
 async def delete_person(
@@ -471,6 +495,7 @@ async def delete_person(
     invite_repo: InviteRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> None:
     """Удаляет человека физически, либо, если у него есть дети, превращает
 
@@ -502,51 +527,52 @@ async def delete_person(
     скоупа первой версии (SPEC 7), поэтому families.owner_account_id указывал
     бы на аккаунт, у которого в этой семье больше нет записи человека.
     """
-    person = await person_repo.get(person_id)
-    await _require_owner(family_repo, person.family_id, acting_account_id)
+    async with uow:
+        person = await person_repo.get(person_id)
+        await _require_owner(family_repo, person.family_id, acting_account_id)
 
-    own = await membership_repo.get_by_account_and_family(acting_account_id, person.family_id)
-    if own is not None and own.person_id == person_id:
-        raise ValueError(f"Аккаунт {acting_account_id} не может удалить собственную запись")
+        own = await membership_repo.get_by_account_and_family(acting_account_id, person.family_id)
+        if own is not None and own.person_id == person_id:
+            raise ValueError(f"Аккаунт {acting_account_id} не может удалить собственную запись")
 
-    now = clock.now()
-    for invite in await invite_repo.list_by_person(person_id):
-        if invite.used_at is None and invite.revoked_at is None:
-            await invite_repo.revoke(invite.id, now)
+        now = clock.now()
+        for invite in await invite_repo.list_by_person(person_id):
+            if invite.used_at is None and invite.revoked_at is None:
+                await invite_repo.revoke(invite.id, now)
 
-    for event in await event_repo.list_by_person(person_id):
-        await reminder_repo.delete_all_for_event(event.id)
-        await event_repo.delete(event.id)
-    await reminder_repo.delete_all_for_person(person_id)
+        for event in await event_repo.list_by_person(person_id):
+            await reminder_repo.delete_all_for_event(event.id)
+            await event_repo.delete(event.id)
+        await reminder_repo.delete_all_for_person(person_id)
 
-    freed = await membership_repo.get_by_person(person_id)
-    await membership_repo.delete(person_id)
-    if freed is not None:
-        await _drop_current_family(
-            freed.account_id, person.family_id, account_repo, membership_repo
-        )
+        freed = await membership_repo.get_by_person(person_id)
+        await membership_repo.delete(person_id)
+        if freed is not None:
+            await _drop_current_family(
+                freed.account_id, person.family_id, account_repo, membership_repo
+            )
 
-    relations = await relation_repo.list_by_family(person.family_id)
-    has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
-    parent_ids = {
-        r.parent_id for r in relations if isinstance(r, ParentOf) and r.child_id == person_id
-    }
-    for relation in relations:
-        if (isinstance(relation, ParentOf) and relation.child_id == person_id) or (
-            isinstance(relation, SpouseOf) and person_id in (relation.a_id, relation.b_id)
-        ):
-            await relation_repo.remove(person.family_id, relation)
+        relations = await relation_repo.list_by_family(person.family_id)
+        has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
+        parent_ids = {
+            r.parent_id for r in relations if isinstance(r, ParentOf) and r.child_id == person_id
+        }
+        for relation in relations:
+            if (isinstance(relation, ParentOf) and relation.child_id == person_id) or (
+                isinstance(relation, SpouseOf) and person_id in (relation.a_id, relation.b_id)
+            ):
+                await relation_repo.remove(person.family_id, relation)
 
-    if has_children:
-        person.name = None
-        person.gender = None
-        person.birth_date = None
-        person.is_placeholder = True
-        await person_repo.update(person)
-    else:
-        await person_repo.delete(person_id)
+        if has_children:
+            person.name = None
+            person.gender = None
+            person.birth_date = None
+            person.is_placeholder = True
+            await person_repo.update(person)
+        else:
+            await person_repo.delete(person_id)
 
-    await _drop_childless_placeholders(parent_ids, person.family_id, person_repo, relation_repo)
+        await _drop_childless_placeholders(parent_ids, person.family_id, person_repo, relation_repo)
 
 
 async def _drop_current_family(
@@ -632,6 +658,7 @@ async def issue_invite(
     membership_repo: MembershipRepo,
     invite_repo: InviteRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Invite:
     """Одноразовое приглашение сроком на семь дней.
 
@@ -644,25 +671,28 @@ async def issue_invite(
     показывает получателю «Антон приглашает вас как Марину», а заглушке
     показывать нечего.
     """
-    person = await person_repo.get(person_id)
-    await _require_owner(family_repo, person.family_id, acting_account_id)
+    async with uow:
+        person = await person_repo.get(person_id)
+        await _require_owner(family_repo, person.family_id, acting_account_id)
 
-    if person.is_placeholder:
-        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, не приглашается")
-    if await membership_repo.get_by_person(person_id) is not None:
-        raise ValueError(f"Запись {person_id} уже привязана к аккаунту")
+        if person.is_placeholder:
+            raise ValueError(
+                f"Запись {person_id} — заглушка неизвестного родителя, не приглашается"
+            )
+        if await membership_repo.get_by_person(person_id) is not None:
+            raise ValueError(f"Запись {person_id} уже привязана к аккаунту")
 
-    now = clock.now()
-    return await invite_repo.create(
-        Invite(
-            id=0,
-            family_id=person.family_id,
-            person_id=person_id,
-            code=_generate_invite_code(),
-            created_at=now,
-            expires_at=now + INVITE_TTL,
+        now = clock.now()
+        return await invite_repo.create(
+            Invite(
+                id=0,
+                family_id=person.family_id,
+                person_id=person_id,
+                code=_generate_invite_code(),
+                created_at=now,
+                expires_at=now + INVITE_TTL,
+            )
         )
-    )
 
 
 async def revoke_invite(
@@ -671,6 +701,7 @@ async def revoke_invite(
     family_repo: FamilyRepo,
     invite_repo: InviteRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> None:
     """Отзывает ещё не использованное приглашение (SPEC 3.2, критерий приёмки 25).
 
@@ -678,11 +709,12 @@ async def revoke_invite(
     принадлежит приглашение, и если оно уже использовано — отзывать больше
     нечего, аккаунт уже привязан.
     """
-    invite = await invite_repo.get(invite_id)
-    await _require_owner(family_repo, invite.family_id, acting_account_id)
-    if invite.used_at is not None:
-        raise ValueError(f"Приглашение {invite_id} уже использовано")
-    await invite_repo.revoke(invite_id, clock.now())
+    async with uow:
+        invite = await invite_repo.get(invite_id)
+        await _require_owner(family_repo, invite.family_id, acting_account_id)
+        if invite.used_at is not None:
+            raise ValueError(f"Приглашение {invite_id} уже использовано")
+        await invite_repo.revoke(invite_id, clock.now())
 
 
 async def accept_invite(
@@ -697,6 +729,7 @@ async def accept_invite(
     override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Person:
     """Привязывает Telegram-аккаунт к записи, на которую выдано приглашение.
 
@@ -731,71 +764,81 @@ async def accept_invite(
     (SPEC 3.4): иначе неизвестный пояс уронил бы материализацию уже после
     mark_used, то есть одноразовый код сгорел бы ни за что.
     """
-    _require_known_timezone(timezone)
+    async with uow:
+        _require_known_timezone(timezone)
 
-    invite = await invite_repo.get_by_code(code)
-    if invite is None:
-        raise ValueError("Приглашение не найдено")
+        invite = await invite_repo.get_by_code(code)
+        if invite is None:
+            raise ValueError("Приглашение не найдено")
 
-    now = clock.now()
-    if invite.revoked_at is not None:
-        raise ValueError("Приглашение отозвано")
-    if invite.used_at is not None:
-        raise ValueError("Приглашение уже использовано")
-    if now > invite.expires_at:
-        raise ValueError("Приглашение просрочено")
-    if await membership_repo.get_by_person(invite.person_id) is not None:
-        raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+        now = clock.now()
+        if invite.revoked_at is not None:
+            raise ValueError("Приглашение отозвано")
+        if invite.used_at is not None:
+            raise ValueError("Приглашение уже использовано")
+        if now > invite.expires_at:
+            raise ValueError("Приглашение просрочено")
+        if await membership_repo.get_by_person(invite.person_id) is not None:
+            raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
 
-    # Запись ищется среди людей семьи, а не через PersonRepo.get: тот обязан
-    # вернуть Person и на отсутствующий id ответит ошибкой хранилища, а здесь
-    # нужен обычный отказ сценария.
-    person = next(
-        (p for p in await person_repo.list_by_family(invite.family_id) if p.id == invite.person_id),
-        None,
-    )
-    if person is None:
-        raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
-    if person.is_placeholder:
-        raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
+        # Запись ищется среди людей семьи, а не через PersonRepo.get: тот обязан
+        # вернуть Person и на отсутствующий id ответит ошибкой хранилища, а здесь
+        # нужен обычный отказ сценария.
+        person = next(
+            (
+                p
+                for p in await person_repo.list_by_family(invite.family_id)
+                if p.id == invite.person_id
+            ),
+            None,
+        )
+        if person is None:
+            raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
+        if person.is_placeholder:
+            raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
 
-    account = await account_repo.get_by_telegram_user_id(telegram_user_id)
-    if account is None:
-        account = await account_repo.save(
-            Account(
-                id=0,
-                telegram_user_id=telegram_user_id,
-                current_family_id=None,
-                timezone=timezone,
-                offsets_days=DEFAULT_OFFSETS_DAYS,
-                time_of_day=DEFAULT_TIME_OF_DAY,
+        account = await account_repo.get_by_telegram_user_id(telegram_user_id)
+        if account is None:
+            account = await account_repo.save(
+                Account(
+                    id=0,
+                    telegram_user_id=telegram_user_id,
+                    current_family_id=None,
+                    timezone=timezone,
+                    offsets_days=DEFAULT_OFFSETS_DAYS,
+                    time_of_day=DEFAULT_TIME_OF_DAY,
+                )
+            )
+        elif (
+            await membership_repo.get_by_account_and_family(account.id, invite.family_id)
+            is not None
+        ):
+            raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+
+        membership = await membership_repo.create(
+            Membership(
+                account_id=account.id, family_id=invite.family_id, person_id=invite.person_id
             )
         )
-    elif await membership_repo.get_by_account_and_family(account.id, invite.family_id) is not None:
-        raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+        await invite_repo.mark_used(invite.id, now)
 
-    membership = await membership_repo.create(
-        Membership(account_id=account.id, family_id=invite.family_id, person_id=invite.person_id)
-    )
-    await invite_repo.mark_used(invite.id, now)
+        if account.current_family_id is None:
+            account.current_family_id = invite.family_id
+            account = await account_repo.save(account)
 
-    if account.current_family_id is None:
-        account.current_family_id = invite.family_id
-        account = await account_repo.save(account)
+        reminders: list[Reminder] = []
+        for event in await event_repo.list_by_family(invite.family_id):
+            override = await override_repo.get(account.id, event.id)
+            effective_account = account
+            if override is not None:
+                effective_account = replace(
+                    account, offsets_days=override.offsets_days, time_of_day=override.time_of_day
+                )
+            reminders.extend(materialize_for_event(event, [(membership, effective_account)], clock))
+        if reminders:
+            await reminder_repo.add_many(reminders)
 
-    reminders: list[Reminder] = []
-    for event in await event_repo.list_by_family(invite.family_id):
-        override = await override_repo.get(account.id, event.id)
-        effective_account = account
-        if override is not None:
-            effective_account = replace(
-                account, offsets_days=override.offsets_days, time_of_day=override.time_of_day
-            )
-        reminders.extend(materialize_for_event(event, [(membership, effective_account)], clock))
-    if reminders:
-        await reminder_repo.add_many(reminders)
-
-    return person
+        return person
 
 
 async def add_event(
@@ -812,6 +855,7 @@ async def add_event(
     membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Event:
     """Добавляет событие и сразу материализует по нему напоминания.
 
@@ -822,31 +866,34 @@ async def add_event(
     Отклоняет и заглушку: она не порождает событий (SPEC 4.1) — имени у неё
     нет, так что текст напоминания ушёл бы всей семье с пустым получателем.
     """
-    await _require_owner(family_repo, family_id, acting_account_id)
+    async with uow:
+        await _require_owner(family_repo, family_id, acting_account_id)
 
-    person = await person_repo.get(person_id)
-    if person.family_id != family_id:
-        raise ValueError(f"Человек {person_id} не принадлежит семье {family_id}")
-    if person.is_placeholder:
-        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, событий не имеет")
+        person = await person_repo.get(person_id)
+        if person.family_id != family_id:
+            raise ValueError(f"Человек {person_id} не принадлежит семье {family_id}")
+        if person.is_placeholder:
+            raise ValueError(
+                f"Запись {person_id} — заглушка неизвестного родителя, событий не имеет"
+            )
 
-    event = await event_repo.create(
-        Event(
-            id=0,
-            family_id=family_id,
-            person_id=person_id,
-            title=title,
-            date=event_date,
-            is_recurring_yearly=is_recurring_yearly,
-            kind=EventKind.CUSTOM,
+        event = await event_repo.create(
+            Event(
+                id=0,
+                family_id=family_id,
+                person_id=person_id,
+                title=title,
+                date=event_date,
+                is_recurring_yearly=is_recurring_yearly,
+                kind=EventKind.CUSTOM,
+            )
         )
-    )
-    recipients = await _recipients(family_id, membership_repo, account_repo)
-    reminders = materialize_for_event(event, recipients, clock)
-    if reminders:
-        await reminder_repo.add_many(reminders)
+        recipients = await _recipients(family_id, membership_repo, account_repo)
+        reminders = materialize_for_event(event, recipients, clock)
+        if reminders:
+            await reminder_repo.add_many(reminders)
 
-    return event
+        return event
 
 
 async def update_account_settings(
@@ -860,6 +907,7 @@ async def update_account_settings(
     override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> Account:
     """Меняет пояс, смещения и время суток. Настройки принадлежат аккаунту, а не
 
@@ -874,22 +922,23 @@ async def update_account_settings(
     а перематериализация упала бы на середине, оставив часть семей с
     напоминаниями по старым настройкам и часть — вообще без будущих строк.
     """
-    _require_known_timezone(timezone)
-    _require_valid_offsets(offsets_days)
+    async with uow:
+        _require_known_timezone(timezone)
+        _require_valid_offsets(offsets_days)
 
-    account = await account_repo.get(account_id)
-    account.timezone = timezone
-    account.offsets_days = offsets_days
-    account.time_of_day = time_of_day
-    account = await account_repo.save(account)
+        account = await account_repo.get(account_id)
+        account.timezone = timezone
+        account.offsets_days = offsets_days
+        account.time_of_day = time_of_day
+        account = await account_repo.save(account)
 
-    for membership in await membership_repo.list_by_account(account_id):
-        for event in await event_repo.list_by_family(membership.family_id):
-            await _rematerialize_event_for_person(
-                event, membership, account, override_repo, reminder_repo, clock
-            )
+        for membership in await membership_repo.list_by_account(account_id):
+            for event in await event_repo.list_by_family(membership.family_id):
+                await _rematerialize_event_for_person(
+                    event, membership, account, override_repo, reminder_repo, clock
+                )
 
-    return account
+        return account
 
 
 async def set_override(
@@ -903,6 +952,7 @@ async def set_override(
     membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
     clock: Clock,
+    uow: UnitOfWork,
 ) -> ReminderOverride:
     """Переопределяет смещения и время суток для пары (аккаунт, событие) и
 
@@ -924,27 +974,28 @@ async def set_override(
     update_account_settings: смещения переопределения попадают в те же
     reminders.
     """
-    _require_valid_offsets(offsets_days)
+    async with uow:
+        _require_valid_offsets(offsets_days)
 
-    event = await event_repo.get(event_id)
-    membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
-    if membership is None:
-        raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
+        event = await event_repo.get(event_id)
+        membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
+        if membership is None:
+            raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
 
-    override = ReminderOverride(
-        account_id=account_id,
-        event_id=event_id,
-        offsets_days=offsets_days,
-        time_of_day=time_of_day,
-    )
-    await override_repo.set(override)
+        override = ReminderOverride(
+            account_id=account_id,
+            event_id=event_id,
+            offsets_days=offsets_days,
+            time_of_day=time_of_day,
+        )
+        await override_repo.set(override)
 
-    account = await account_repo.get(account_id)
-    await _rematerialize_event_for_person(
-        event, membership, account, override_repo, reminder_repo, clock
-    )
+        account = await account_repo.get(account_id)
+        await _rematerialize_event_for_person(
+            event, membership, account, override_repo, reminder_repo, clock
+        )
 
-    return override
+        return override
 
 
 async def set_current_family(
@@ -952,14 +1003,16 @@ async def set_current_family(
     family_id: int,
     account_repo: AccountRepo,
     membership_repo: MembershipRepo,
+    uow: UnitOfWork,
 ) -> Account:
     """Меняет текущую семью аккаунта, к которой относятся команды добавления и просмотра.
 
     Отклоняет семью, в которой у аккаунта нет своей записи (membership_repo).
     """
-    if await membership_repo.get_by_account_and_family(account_id, family_id) is None:
-        raise ValueError(f"Аккаунт {account_id} не состоит в семье {family_id}")
+    async with uow:
+        if await membership_repo.get_by_account_and_family(account_id, family_id) is None:
+            raise ValueError(f"Аккаунт {account_id} не состоит в семье {family_id}")
 
-    account = await account_repo.get(account_id)
-    account.current_family_id = family_id
-    return await account_repo.save(account)
+        account = await account_repo.get(account_id)
+        account.current_family_id = family_id
+        return await account_repo.save(account)

@@ -92,7 +92,7 @@ in-memory реализации в тестах). `add_person` и `add_event` с�
 
 Готово: сценарии этапов 3a и 3b проходят на in-memory реализациях портов.
 
-## Этап 4. Storage: SQLite-адаптеры
+## Этап 4. Storage: SQLite-адаптеры (готово)
 
 - `storage/db.py`: `connect` (PRAGMA), `apply_migrations`.
 - `storage/migrations/000N_*.sql`: полная схема из SPEC.md 5.3.
