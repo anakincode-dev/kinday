@@ -688,8 +688,21 @@ class SqliteReminderRepo:
     async def mark_missed(self, reminder_id: int, at: datetime) -> None:
         await self._set_status(reminder_id, ReminderStatus.MISSED, at)
 
-    async def mark_failed(self, reminder_id: int, at: datetime) -> None:
-        await self._set_status(reminder_id, ReminderStatus.FAILED, at)
+    async def mark_failed(self, reminder_id: int, at: datetime, *, attempted: bool) -> None:
+        """`attempted` увеличивает attempts: это след того, что send вызывался."""
+        if not attempted:
+            await self._set_status(reminder_id, ReminderStatus.FAILED, at)
+            return
+        await self._database.run(
+            lambda c: c.execute(
+                """
+                UPDATE reminders
+                   SET status = 'failed', status_changed_at = ?, attempts = attempts + 1
+                 WHERE id = ?
+                """,
+                (dump_datetime(at), reminder_id),
+            )
+        )
 
     async def _set_status(self, reminder_id: int, status: ReminderStatus, at: datetime) -> None:
         """sent_at не трогается: по SPEC 5.3 это момент фактической отправки."""
@@ -794,15 +807,24 @@ class SqliteReminderRepo:
             lambda c: c.execute("DELETE FROM reminders WHERE person_id = ?", (person_id,))
         )
 
-    async def delete_future_failed_for_person(self, person_id: int, after: datetime) -> None:
-        """Обратный путь к 403: без удаления уникальный индекс не даст построить их заново."""
+    async def delete_recoverable_failed_for_person(
+        self, person_id: int, attempted_after: datetime, unattempted_after: datetime
+    ) -> None:
+        """Обратный путь к 403: без удаления уникальный индекс не даст построить их заново.
+
+        Строку, по которой отправка была (attempts больше нуля), удаляем только
+        из будущего: её сообщение могло дойти. Строку, до которой тик не
+        добрался (attempts равно нулю), — с более раннего порога: терять её не за
+        что. Границы строгие, строка со сроком ровно на пороге остаётся.
+        """
         await self._database.run(
             lambda c: c.execute(
                 """
                 DELETE FROM reminders
-                 WHERE person_id = ? AND status = 'failed' AND due_at_utc >= ?
+                 WHERE person_id = ? AND status = 'failed'
+                   AND (due_at_utc > ? OR (attempts = 0 AND due_at_utc > ?))
                 """,
-                (person_id, dump_datetime(after)),
+                (person_id, dump_datetime(attempted_after), dump_datetime(unattempted_after)),
             )
         )
 
@@ -823,13 +845,17 @@ class SqliteReminderRepo:
         return await self._database.run(work)
 
     async def fail_all_sending(self, at: datetime) -> int:
-        """SPEC 5.5: строки, застрявшие в sending после падения, повторно не отправляются."""
+        """SPEC 5.5: строки, застрявшие в sending после падения, повторно не отправляются.
+
+        attempts растёт: в sending строка попадает только после захвата тиком, то
+        есть отправка по ней уже шла, и /start её потом не воскресит.
+        """
 
         def work(connection: sqlite3.Connection) -> int:
             cursor = connection.execute(
                 """
                 UPDATE reminders
-                   SET status = 'failed', status_changed_at = ?
+                   SET status = 'failed', status_changed_at = ?, attempts = attempts + 1
                  WHERE status = 'sending'
                 """,
                 (dump_datetime(at),),

@@ -1351,19 +1351,44 @@ async def enable_delivery(
     будущие failed-строки сначала удаляются, а потом горизонт строится заново по
     всем событиям всех семей аккаунта — ровно так же, как при смене его настроек.
 
-    Прошлое не переписывается: порог — MISFIRE_GRACE назад от текущего момента
-    (та же граница, что в _rematerialize_event_for_person), так что запись о
-    недоставленных напоминаниях остаётся, а восстанавливается только будущее.
+    Пересчёт делается только если доставка и правда была отключена. Обычный
+    /start от живого аккаунта — это просто «бот, вот мой чат»: трогать его
+    напоминания не за что, а любое удаление и перестройка здесь рискуют второй
+    отправкой. Сам /start пользователь жмёт когда угодно, в том числе через
+    минуту после того, как сообщение ушло.
+
+    Что именно восстанавливать, решает `attempts` — единственный след того, что
+    `send` по строке вызывался.
+
+    Строка с отправкой в прошлом остаётся закрытой: сообщение могло дойти. Так
+    закрываются строка, на которой пришёл 403, строка, застрявшая в `sending`
+    после падения между send и mark (её закрыл fail_stuck_sending при старте), и
+    строка, исчерпавшая пять попыток. Воскресишь такую — и следующий тик отправит
+    то же сообщение второй раз, а SPEC 5.5 считает повтор хуже пропуска.
+
+    Строка без отправки восстанавливается и в прошлом, в пределах окна просрочки
+    (`MISFIRE_GRACE`). Иначе терялось бы вот что: 403 приходит на одну строку, а
+    `disable_delivery` закрывает заодно весь горизонт аккаунта, и напоминания
+    одного аккаунта приходятся на одно местное время, то есть в ту же минуту
+    обычно наступило ещё несколько. По ним `send` не вызывался ни разу, и SPEC 4
+    с критерием приёмки 12 требуют доставить их, если опоздание меньше суток и
+    дата события ещё впереди.
 
     Вызывает этот сценарий Telegram-слой на /start (этап 6): ядро о транспорте
     ничего не знает и получает только chat_id.
     """
     async with uow:
         account = await account_repo.get(account_id)
+        was_disabled = not account.delivery_enabled
         account = await account_repo.save(replace(account, chat_id=chat_id, delivery_enabled=True))
-        not_before = clock.now() - timedelta(seconds=MISFIRE_GRACE)
+        if not was_disabled:
+            return account
+        now = clock.now()
+        recoverable_since = now - timedelta(seconds=MISFIRE_GRACE)
         for membership in await membership_repo.list_by_account(account_id):
-            await reminder_repo.delete_future_failed_for_person(membership.person_id, not_before)
+            await reminder_repo.delete_recoverable_failed_for_person(
+                membership.person_id, now, recoverable_since
+            )
             for event in await event_repo.list_by_family(membership.family_id):
                 await _rematerialize_event_for_person(
                     event, membership, account, override_repo, reminder_repo, clock

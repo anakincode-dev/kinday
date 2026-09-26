@@ -174,7 +174,10 @@ async def test_start_after_block_restores_delivery(
     account.delivery_enabled = False
     await sqlite_world.account.save(account)
     for reminder in await sqlite_world.read_reminders():
-        await sqlite_world.reminder.mark_failed(reminder.id, datetime(2027, 1, 1, tzinfo=UTC))
+        # Так их закрывает disable_delivery: отправки по ним не было.
+        await sqlite_world.reminder.mark_failed(
+            reminder.id, datetime(2027, 1, 1, tzinfo=UTC), attempted=False
+        )
 
     answers = await telegram.send("/start", user_id=ANTON)
 

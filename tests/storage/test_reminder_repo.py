@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from tests.core.fakes import FixedClock
@@ -115,7 +115,7 @@ async def test_marks_record_status_and_moment(sqlite_world: World, database: Dat
 
     await sqlite_world.reminder.mark_sent(sent.id, at)
     await sqlite_world.reminder.mark_missed(missed.id, at)
-    await sqlite_world.reminder.mark_failed(failed.id, at)
+    await sqlite_world.reminder.mark_failed(failed.id, at, attempted=False)
 
     stored = {r.id: r for r in await sqlite_world.read_reminders()}
     assert stored[sent.id].status == ReminderStatus.SENT
@@ -124,6 +124,8 @@ async def test_marks_record_status_and_moment(sqlite_world: World, database: Dat
     assert stored[missed.id].sent_at is None
     assert stored[failed.id].status == ReminderStatus.FAILED
     assert stored[failed.id].sent_at is None
+    # attempted=False — отправки не было, счётчик попыток не двигается.
+    assert stored[failed.id].attempts == 0
 
     rows = await database.run(
         lambda c: c.execute("SELECT id, status_changed_at FROM reminders").fetchall()
@@ -162,10 +164,38 @@ async def test_fail_all_sending_closes_rows_left_by_a_crash(
     stored = await sqlite_world.read_reminders()
     assert {r.status for r in stored} == {ReminderStatus.FAILED}
     assert len(claimed) == len(stored)
+    # Строка попадает в sending только после захвата, то есть send по ней
+    # вызывался: попытка считается, и /start такую строку больше не воскресит.
+    assert {r.attempts for r in stored} == {1}
     rows = await database.run(
         lambda c: c.execute("SELECT DISTINCT status_changed_at FROM reminders").fetchall()
     )
     assert [row["status_changed_at"] for row in rows] == [dump_datetime(restart_at)]
+
+
+@pytest.mark.asyncio
+async def test_delete_recoverable_failed_keeps_rows_with_an_attempt(sqlite_world: World) -> None:
+    """Два порога: строку с попыткой отправки возвращает только будущий срок.
+
+    Строка, по которой `send` вызывался (`attempts` больше нуля), сравнивается с
+    поздним порогом: сообщение могло дойти, и воскрешать её в прошлом нельзя.
+    Строка без попытки сравнивается с ранним порогом — началом окна просрочки.
+    """
+    ordered = sorted(await _reminders_of_one_event(sqlite_world), key=lambda r: r.due_at_utc)
+    stale, attempted, fresh = ordered
+    now = fresh.due_at_utc
+    await sqlite_world.reminder.mark_failed(stale.id, now, attempted=False)
+    await sqlite_world.reminder.mark_failed(attempted.id, now, attempted=True)
+    await sqlite_world.reminder.mark_failed(fresh.id, now, attempted=False)
+    counters = {r.id: r.attempts for r in await sqlite_world.read_reminders()}
+    assert (counters[stale.id], counters[attempted.id], counters[fresh.id]) == (0, 1, 0)
+
+    await sqlite_world.reminder.delete_recoverable_failed_for_person(
+        fresh.person_id, now, now - timedelta(days=2)
+    )
+
+    # Уцелели обе закрытые навсегда: слишком старая и та, по которой была попытка.
+    assert {r.id for r in await sqlite_world.read_reminders()} == {stale.id, attempted.id}
 
 
 @pytest.mark.asyncio
