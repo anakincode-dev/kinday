@@ -31,8 +31,9 @@ def connect(database_path: str) -> sqlite3.Connection:
     `check_same_thread=False` — обращения приходят из разных потоков
     `asyncio.to_thread`, а не из нескольких сразу: доступ упорядочивает
     `Database`. `isolation_level=None` отключает неявные транзакции драйвера:
-    отдельный запрос фиксируется сразу (так работает claim из SPEC 5.5), а
-    границу сценария задаёт явный BEGIN в `SqliteUnitOfWork`.
+    запрос вне единицы работы фиксируется сразу (так читают репозитории), а
+    границу записи задаёт явный BEGIN в `SqliteUnitOfWork` — в том числе у
+    каждого из трёх шагов тика (SPEC 5.5).
     """
     connection = sqlite3.connect(database_path, check_same_thread=False, isolation_level=None)
     connection.row_factory = sqlite3.Row

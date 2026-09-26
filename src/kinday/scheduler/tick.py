@@ -1,8 +1,11 @@
 """Тик раз в минуту: claim, send, mark (см. SPEC 5.5).
 
-Три шага вместо одной транзакции: отправка в Telegram — сетевой вызов, держать
-его внутри транзакции нельзя. Поэтому строка сначала переводится в `sending`
-отдельной фиксацией, потом уходит сообщение, потом ставится итоговый статус.
+Три шага — три отдельные короткие транзакции. Отправка в Telegram сетевой
+вызов, и держать на ней открытую транзакцию нельзя: замок базы стоял бы всё
+время таймаута Telegram, а вместе с ним встали бы и диалоги бота. Поэтому
+claim фиксируется своей единицей работы, `Notifier.send` вызывается вне любой
+транзакции, итоговый статус ставится своей единицей работы на каждую строку.
+
 Гарантия — сообщение уходит не больше одного раза: при сомнениях строка
 закрывается, а не отправляется повторно.
 """
@@ -24,6 +27,7 @@ from kinday.core.ports import (
     RelationRepo,
     ReminderRepo,
     TransportError,
+    UnitOfWork,
 )
 from kinday.core.services import SendPlan, SkipReason, disable_delivery, plan_reminder_delivery
 
@@ -47,6 +51,7 @@ async def run_tick(
     person_repo: PersonRepo,
     relation_repo: RelationRepo,
     reminder_repo: ReminderRepo,
+    unit_of_work: UnitOfWork,
 ) -> None:
     """Забирает due-напоминания по одному, отправляет, отмечает результат. Просроченные — missed.
 
@@ -70,7 +75,8 @@ async def run_tick(
     """
     now = clock.now()
     for _ in range(MAX_REMINDERS_PER_TICK):
-        claimed = await reminder_repo.claim_due(now, 1)
+        async with unit_of_work:
+            claimed = await reminder_repo.claim_due(now, 1)
         if not claimed:
             return
         keep_going = await _handle_one(
@@ -83,6 +89,7 @@ async def run_tick(
             person_repo,
             relation_repo,
             reminder_repo,
+            unit_of_work,
         )
         if not keep_going:
             return
@@ -99,11 +106,17 @@ async def _handle_one(
     person_repo: PersonRepo,
     relation_repo: RelationRepo,
     reminder_repo: ReminderRepo,
+    unit_of_work: UnitOfWork,
 ) -> bool:
     """Решает судьбу одной забранной строки: отправить, пропустить или закрыть.
 
     Возвращает False, если тик надо прервать (сетевой сбой), и True, если можно
     брать следующую строку.
+
+    Адрес и текст считает ядро (`plan_reminder_delivery`): у кого нет аккаунта,
+    привязанного чата или включённой доставки, тот получает `failed` без
+    единого обращения к Telegram, а просроченная строка — `missed`. Решение
+    принимается до отправки, поэтому в сеть такие строки не уходят вовсе.
 
     `attempts` проверяется до отправки, а не только после неудачи: между
     `release` и `mark_failed` в `_send_one` строка на миг лежит в `pending` с
@@ -120,7 +133,8 @@ async def _handle_one(
             reminder.id,
             reminder.attempts,
         )
-        await reminder_repo.mark_failed(reminder.id, now)
+        async with unit_of_work:
+            await reminder_repo.mark_failed(reminder.id, now)
         return True
 
     try:
@@ -135,19 +149,30 @@ async def _handle_one(
         )
     except Exception:
         logger.exception("Не удалось собрать напоминание %s, помечено failed", reminder.id)
-        await reminder_repo.mark_failed(reminder.id, now)
+        async with unit_of_work:
+            await reminder_repo.mark_failed(reminder.id, now)
         return True
 
     if plan is SkipReason.MISSED:
         logger.info("Напоминание %s просрочено, помечено missed", reminder.id)
-        await reminder_repo.mark_missed(reminder.id, now)
+        async with unit_of_work:
+            await reminder_repo.mark_missed(reminder.id, now)
         return True
     if plan is SkipReason.UNDELIVERABLE:
         logger.info("Напоминание %s отправлять некуда, помечено failed", reminder.id)
-        await reminder_repo.mark_failed(reminder.id, now)
+        async with unit_of_work:
+            await reminder_repo.mark_failed(reminder.id, now)
         return True
     return await _send_one(
-        reminder.id, reminder.attempts, plan, now, notifier, account_repo, reminder_repo
+        reminder.id,
+        reminder.attempts,
+        plan,
+        now,
+        notifier,
+        account_repo,
+        membership_repo,
+        reminder_repo,
+        unit_of_work,
     )
 
 
@@ -158,16 +183,25 @@ async def _send_one(
     now: datetime,
     notifier: Notifier,
     account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
     reminder_repo: ReminderRepo,
+    unit_of_work: UnitOfWork,
 ) -> bool:
     """Отправляет одно сообщение и ставит итоговый статус по результату (таблица SPEC 5.5).
 
     Возвращает False при сетевом сбое — тику дальше идти незачем.
 
+    `notifier.send` вызывается до любого `async with unit_of_work`: транзакция
+    открывается только на запись результата, уже после того как сеть ответила.
+
     Сетевая ошибка возвращает строку в pending и увеличивает `attempts`
     (`release`); если это была пятая попытка, строка тут же закрывается как
     failed — счётчик к этому моменту уже увеличен, так что в базе остаётся
     честное «пять попыток, больше не пробуем».
+
+    403 закрывает не только эту строку: доставка аккаунту отключается, а его
+    остальные pending-строки закрываются в той же транзакции (disable_delivery).
+    Иначе каждый следующий тик заново получал бы тот же отказ.
 
     Неизвестная ошибка транспорта трактуется как падение между send и mark:
     дошло сообщение или нет, неизвестно, а повторная отправка хуже пропуска
@@ -176,16 +210,24 @@ async def _send_one(
     try:
         await notifier.send(plan.chat_id, plan.text)
     except RecipientBlocked:
+        async with unit_of_work:
+            await reminder_repo.mark_failed(reminder_id, now)
+            closed = await disable_delivery(
+                plan.account_id, now, account_repo, membership_repo, reminder_repo
+            )
         logger.warning(
-            "Аккаунт %s заблокировал бота: доставка отключена, напоминание %s — failed",
+            "Аккаунт %s заблокировал бота: доставка отключена, напоминание %s — failed, "
+            "закрыто ещё %s ожидавших строк",
             plan.account_id,
             reminder_id,
+            closed,
         )
-        await reminder_repo.mark_failed(reminder_id, now)
-        await disable_delivery(plan.account_id, account_repo)
         return True
     except TransportError as error:
-        await reminder_repo.release(reminder_id)
+        async with unit_of_work:
+            await reminder_repo.release(reminder_id)
+            if attempts + 1 >= MAX_ATTEMPTS:
+                await reminder_repo.mark_failed(reminder_id, now)
         if attempts + 1 >= MAX_ATTEMPTS:
             logger.warning(
                 "Напоминание %s не отправлено с %s попыток, помечено failed: %s",
@@ -193,7 +235,6 @@ async def _send_one(
                 MAX_ATTEMPTS,
                 error,
             )
-            await reminder_repo.mark_failed(reminder_id, now)
         else:
             logger.info("Напоминание %s вернулось в pending после сбоя: %s", reminder_id, error)
         return False
@@ -201,9 +242,11 @@ async def _send_one(
         logger.exception(
             "Неизвестная ошибка отправки напоминания %s: повторно не отправляем", reminder_id
         )
-        await reminder_repo.mark_failed(reminder_id, now)
+        async with unit_of_work:
+            await reminder_repo.mark_failed(reminder_id, now)
         return True
-    await reminder_repo.mark_sent(reminder_id, now)
+    async with unit_of_work:
+        await reminder_repo.mark_sent(reminder_id, now)
     return True
 
 

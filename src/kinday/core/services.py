@@ -90,13 +90,20 @@ def _with_real_id(relation: Relation, person_id: int) -> Relation:
     сторону: к детям (parent_id), к своим родителям (child_id) и к супругу
     (merge_placeholder_into всегда кладёт нового родителя первым концом).
     Поэтому подстановка смотрит все поля, а не только parent_id.
+
+    Ребро без заглушечного конца — ошибка в расчёте «вхолостую», а не
+    в данных: проверка поднимает RuntimeError, а не assert, потому что
+    assert выключается при запуске с `python -O` и тогда в хранилище ушло бы
+    ребро с id -1.
     """
     if isinstance(relation, ParentOf):
         if relation.parent_id == _DRY_RUN_PERSON_ID:
             return ParentOf(parent_id=person_id, child_id=relation.child_id)
-        assert relation.child_id == _DRY_RUN_PERSON_ID
+        if relation.child_id != _DRY_RUN_PERSON_ID:
+            raise RuntimeError(f"В ребре {relation} нет заглушечного конца {_DRY_RUN_PERSON_ID}")
         return ParentOf(parent_id=relation.parent_id, child_id=person_id)
-    assert relation.a_id == _DRY_RUN_PERSON_ID
+    if relation.a_id != _DRY_RUN_PERSON_ID:
+        raise RuntimeError(f"В ребре {relation} нет заглушечного конца {_DRY_RUN_PERSON_ID}")
     return SpouseOf(a_id=person_id, b_id=relation.b_id)
 
 
@@ -1162,37 +1169,121 @@ async def plan_reminder_delivery(
     if not account.delivery_enabled or account.chat_id is None:
         return SkipReason.UNDELIVERABLE
 
+    text = await compose_reminder_text(
+        reminder, membership, account, at, event_repo, person_repo, relation_repo
+    )
+    return SendPlan(account_id=account.id, chat_id=account.chat_id, text=text)
+
+
+async def compose_reminder_text(
+    reminder: Reminder,
+    membership: Membership,
+    account: Account,
+    at: datetime,
+    event_repo: EventRepo,
+    person_repo: PersonRepo,
+    relation_repo: RelationRepo,
+) -> str:
+    """Собирает текст одного напоминания на момент `at` (критерий приёмки 13).
+
+    Отсчёт «через N дней» и формулировка даты берутся от «сегодня» получателя, а
+    не по UTC: для аккаунта в Токио вечер 22 февраля по UTC — это уже 23-е, и
+    «через 7 дней» там было бы неправдой. Поэтому локальная дата считается в
+    поясе аккаунта, а не в зоне сервера.
+
+    Родство выводится по текущему графу семьи (infer_relation_text), а не по
+    состоянию на момент материализации: дерево могло измениться, и тогда
+    «ваш отец» в готовом тексте оказалось бы устаревшим.
+
+    Тик эту функцию только вызывает: вся формулировка живёт в ядре, чтобы её
+    можно было проверить без транспорта и повторно использовать в любом другом
+    слое (SPEC 5.1).
+    """
     event = await event_repo.get(reminder.event_id)
     people = {person.id: person for person in await person_repo.list_by_family(event.family_id)}
     relations = await relation_repo.list_by_family(event.family_id)
     hero = people[event.person_id]
 
-    days_until = (reminder.occurrence_date - at.astimezone(ZoneInfo(account.timezone)).date()).days
-    text = reminder_text(
+    today_for_recipient = at.astimezone(ZoneInfo(account.timezone)).date()
+    return reminder_text(
         name=hero.name or "",
         relation_phrase=infer_relation_text(
             membership.person_id, event.person_id, people, relations
         ),
-        days_until=days_until,
+        days_until=(reminder.occurrence_date - today_for_recipient).days,
         event_title=event.title,
         is_birthday=event.is_birthday,
         is_recurring_yearly=event.is_recurring_yearly,
         event_date=reminder.occurrence_date,
         years=age_on(event.date, reminder.occurrence_date),
     )
-    return SendPlan(account_id=account.id, chat_id=account.chat_id, text=text)
 
 
-async def disable_delivery(account_id: int, account_repo: AccountRepo) -> None:
+async def disable_delivery(
+    account_id: int,
+    at: datetime,
+    account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
+    reminder_repo: ReminderRepo,
+) -> int:
     """403: получатель заблокировал бота — снимаем привязку чата и отключаем доставку.
 
     SPEC 5.5: новых напоминаний такому аккаунту не строят (materialize_for_event
-    пропускает delivery_enabled=False), а уже построенные тик закрывает как
-    failed. Доставка включится снова, когда аккаунт заново запустит бота.
+    пропускает delivery_enabled=False). Уже построенные pending-строки
+    закрываются здесь же как failed, во всех семьях аккаунта: каждая следующая
+    отправка вернула бы тот же 403, и держать их до конца горизонта значит
+    стучаться в Telegram зря на каждом тике. Обратный путь — enable_delivery:
+    закрытые строки будущего он удаляет и строит заново, иначе аккаунт,
+    вернувшийся к боту, остался бы без напоминаний по уже построенному
+    горизонту (уникальный индекс SPEC 5.3 на статус не смотрит).
 
-    Без UnitOfWork: это одна строка, и вызывает её тик, где каждый шаг
-    (claim, send, mark) фиксируется отдельно и сетевой вызов не держит
-    транзакцию (SPEC 5.5).
+    Возвращает число закрытых строк. Своей единицы работы не открывает:
+    вызывается тиком внутри транзакции шага mark, а вложенных транзакций порт
+    UnitOfWork не обещает.
     """
     account = await account_repo.get(account_id)
     await account_repo.save(replace(account, chat_id=None, delivery_enabled=False))
+    closed = 0
+    for membership in await membership_repo.list_by_account(account_id):
+        closed += await reminder_repo.fail_pending_for_person(membership.person_id, at)
+    return closed
+
+
+async def enable_delivery(
+    account_id: int,
+    chat_id: int,
+    account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
+    event_repo: EventRepo,
+    override_repo: ReminderOverrideRepo,
+    reminder_repo: ReminderRepo,
+    clock: Clock,
+    uow: UnitOfWork,
+) -> Account:
+    """Повторный запуск бота: привязываем чат, включаем доставку, возвращаем напоминания.
+
+    SPEC 5.5 отключает доставку «до повторного запуска бота» — значит после него
+    напоминания обязаны пойти снова. Одной записи `delivery_enabled=True` для
+    этого мало: строки, закрытые disable_delivery как failed, никуда не делись, а
+    уникальный индекс (SPEC 5.3) не позволит построить на их место новые. Поэтому
+    будущие failed-строки сначала удаляются, а потом горизонт строится заново по
+    всем событиям всех семей аккаунта — ровно так же, как при смене его настроек.
+
+    Прошлое не переписывается: порог — MISFIRE_GRACE назад от текущего момента
+    (та же граница, что в _rematerialize_event_for_person), так что запись о
+    недоставленных напоминаниях остаётся, а восстанавливается только будущее.
+
+    Вызывает этот сценарий Telegram-слой на /start (этап 6): ядро о транспорте
+    ничего не знает и получает только chat_id.
+    """
+    async with uow:
+        account = await account_repo.get(account_id)
+        account = await account_repo.save(replace(account, chat_id=chat_id, delivery_enabled=True))
+        not_before = clock.now() - timedelta(seconds=MISFIRE_GRACE)
+        for membership in await membership_repo.list_by_account(account_id):
+            await reminder_repo.delete_future_failed_for_person(membership.person_id, not_before)
+            for event in await event_repo.list_by_family(membership.family_id):
+                await _rematerialize_event_for_person(
+                    event, membership, account, override_repo, reminder_repo, clock
+                )
+        return account

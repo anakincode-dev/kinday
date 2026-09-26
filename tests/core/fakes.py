@@ -312,6 +312,25 @@ class FakeReminderRepo:
     async def delete_all_for_person(self, person_id: int) -> None:
         self.reminders = [r for r in self.reminders if r.person_id != person_id]
 
+    async def delete_future_failed_for_person(self, person_id: int, after: datetime) -> None:
+        self.reminders = [
+            r
+            for r in self.reminders
+            if not (
+                r.person_id == person_id
+                and r.status == ReminderStatus.FAILED
+                and r.due_at_utc >= after
+            )
+        ]
+
+    async def fail_pending_for_person(self, person_id: int, at: datetime) -> int:
+        closed = 0
+        for reminder in self.reminders:
+            if reminder.person_id == person_id and reminder.status == ReminderStatus.PENDING:
+                reminder.status = ReminderStatus.FAILED
+                closed += 1
+        return closed
+
     async def fail_all_sending(self, at: datetime) -> int:
         closed = 0
         for reminder in self.reminders:

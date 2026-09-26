@@ -21,6 +21,7 @@ from kinday.core.services import (
     clear_override,
     create_family,
     delete_person,
+    enable_delivery,
     issue_invite,
     revoke_invite,
     set_current_family,
@@ -275,6 +276,20 @@ async def clear_override_in(world: World, *, clock: Clock, account_id: int, even
         world.event,
         world.account,
         world.membership,
+        world.reminder,
+        clock,
+        world.uow,
+    )
+
+
+async def enable_delivery_in(world: World, *, clock: Clock, account_id: int, chat_id: int) -> None:
+    await enable_delivery(
+        account_id,
+        chat_id,
+        world.account,
+        world.membership,
+        world.event,
+        world.override,
         world.reminder,
         clock,
         world.uow,

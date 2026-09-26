@@ -62,6 +62,7 @@ async def _materialize(world: World, clock: Clock) -> None:
         world.membership,
         world.override,
         world.reminder,
+        world.uow,
     )
 
 
