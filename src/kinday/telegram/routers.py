@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -23,7 +24,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from kinday.core import services
-from kinday.core.models import Account, Gender, Person
+from kinday.core.models import Account, Event, Gender, Person
 from kinday.core.ports import (
     AccountRepo,
     Clock,
@@ -69,13 +70,30 @@ RELATION_WORDS: dict[str, RelationKind] = {
 YES_WORDS = frozenset({"да", "ага", "конечно"})
 NO_WORDS = frozenset({"нет", "не"})
 
+TIME_FORMAT = "%H:%M"
+TIME_HINT = "ЧЧ:ММ"
+
+# Подписи кнопок выбора в /event_settings. Ответ узнаётся по первому слову:
+# нажатая кнопка приходит целиком, а руками пишут короче — «свои», «как раньше».
+OWN_SETTINGS = "свои настройки"
+ACCOUNT_SETTINGS = "как в настройках"
+
+OFFSETS_HINT = (
+    "За сколько дней напоминать? Перечислите числа через запятую, "
+    "0 — в день события. Например: 7, 1, 0"
+)
+OFFSETS_NOT_UNDERSTOOD = "Не понял: нужны числа через запятую, например 7, 1, 0."
+
 MENU = (
     "Что я умею:\n"
     "/new_family — создать семью\n"
     "/join — присоединиться по коду приглашения\n"
     "/add_person — добавить родственника\n"
+    "/add_event — добавить событие\n"
     "/invite — выдать приглашение на запись\n"
     "/timezone — сменить часовой пояс\n"
+    "/settings — за сколько дней и во сколько напоминать\n"
+    "/event_settings — своё расписание для одного события\n"
     "/family — выбрать текущую семью\n"
     "/cancel — прервать диалог"
 )
@@ -134,6 +152,31 @@ class NewPerson(StatesGroup):
     gender = State()
     birth_date = State()
     siblings = State()
+
+
+class NewEvent(StatesGroup):
+    """Добавление события (SPEC 4.2): о ком оно, как называется, когда, повторяется ли."""
+
+    person = State()
+    title = State()
+    event_date = State()
+    yearly = State()
+
+
+class ChangingSettings(StatesGroup):
+    """Свои смещения и время суток — они у аккаунта, а не у семьи (SPEC 2.1, критерий 27)."""
+
+    offsets = State()
+    time_of_day = State()
+
+
+class ChangingEventSettings(StatesGroup):
+    """Переопределение по одному событию и его снятие (SPEC 5.6, критерий 27)."""
+
+    event = State()
+    mode = State()
+    offsets = State()
+    time_of_day = State()
 
 
 class Joining(StatesGroup):
@@ -205,6 +248,44 @@ def _parse_date(text: str) -> date | None:
         return None
 
 
+def _parse_time(text: str) -> time | None:
+    try:
+        return datetime.strptime(text.strip(), TIME_FORMAT).time()
+    except ValueError:
+        return None
+
+
+def _parse_offsets(text: str) -> tuple[int, ...] | None:
+    """Разбирает «7, 1, 0» в набор смещений. Годность набора решает ядро.
+
+    Здесь только форма записи: разделители и целые неотрицательные числа. Что
+    набор не пуст, без повторов и в пределах 0..365 — доменное правило, его
+    проверяет `update_account_settings` (SPEC 2, критерий приёмки 27), и
+    дублировать его в слое telegram нельзя.
+    """
+    parts = [part for part in re.split(r"[,;\s]+", text.strip()) if part]
+    if not parts or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def _parse_yes_no(text: str) -> bool | None:
+    answer = text.strip().casefold()
+    if answer in YES_WORDS:
+        return True
+    if answer in NO_WORDS:
+        return False
+    return None
+
+
+def _schedule_words(offsets_days: Sequence[int], time_of_day: time) -> str:
+    """«напоминаю за 7, 1, 0 дней (0 — в день события) в 09:00 по вашему времени»."""
+    return (
+        f"напоминаю за {', '.join(str(days) for days in offsets_days)} дней "
+        f"(0 — в день события) в {time_of_day.strftime(TIME_FORMAT)} по вашему времени"
+    )
+
+
 def _text(message: Message) -> str:
     return (message.text or "").strip()
 
@@ -220,6 +301,12 @@ async def _listable_people(deps: Deps, family_id: int) -> list[Person]:
         for person in await deps.person.list_by_family(family_id)
         if not person.is_placeholder
     ]
+
+
+async def _event_labels(deps: Deps, family_id: int, events: Sequence[Event]) -> list[str]:
+    """«День рождения — Пётр»: у всех дней рождения одно название, различает имя."""
+    names = {person.id: person.name for person in await deps.person.list_by_family(family_id)}
+    return [f"{event.title} — {names.get(event.person_id) or ''}".strip(" —") for event in events]
 
 
 async def _account_of(message: Message, deps: Deps) -> Account | None:
@@ -567,12 +654,8 @@ async def new_person_birth_date(message: Message, state: FSMContext, deps: Deps)
 
 async def new_person_siblings(message: Message, state: FSMContext, deps: Deps) -> None:
     """Ответ на вопрос про братьев и сестёр при втором родителе (критерий приёмки 20)."""
-    answer = _text(message).casefold()
-    if answer in YES_WORDS:
-        also = True
-    elif answer in NO_WORDS:
-        also = False
-    else:
+    also = _parse_yes_no(_text(message))
+    if also is None:
         await message.answer("Ответьте «да» или «нет».", reply_markup=_keyboard(["да", "нет"]))
         return
     await _try_add_person(message, state, deps, also_parent_of_siblings=also)
@@ -634,6 +717,301 @@ async def _try_add_person(
     await state.clear()
     await message.answer(
         f"Добавил: {person.name}. Напоминания о дне рождения уже построены.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def cmd_add_event(message: Message, state: FSMContext, deps: Deps) -> None:
+    family_id = await _current_family_id(message, deps)
+    if family_id is None:
+        return
+    people = await _listable_people(deps, family_id)
+    if not people:
+        await message.answer(NO_FAMILY)
+        return
+    await state.set_state(NewEvent.person)
+    await state.update_data(family_id=family_id)
+    await message.answer(
+        "О чьей дате напоминать?\n" + _numbered(_person_labels(people)),
+        reply_markup=_keyboard([f"{i}. {p.name}" for i, p in enumerate(people, 1)]),
+    )
+
+
+async def new_event_person(message: Message, state: FSMContext, deps: Deps) -> None:
+    data = await state.get_data()
+    people = await _listable_people(deps, int(data["family_id"]))
+    index = _pick(_text(message), len(people))
+    if index is None:
+        await message.answer("Нужен номер из списка.\n" + _numbered(_person_labels(people)))
+        return
+    await state.update_data(person_id=people[index].id)
+    await state.set_state(NewEvent.title)
+    await message.answer(
+        "Как назвать событие? Например «Годовщина свадьбы».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def new_event_title(message: Message, state: FSMContext) -> None:
+    title = _text(message)
+    if not title:
+        await message.answer("Название не может быть пустым. Как назвать событие?")
+        return
+    await state.update_data(title=title)
+    await state.set_state(NewEvent.event_date)
+    await message.answer(f"Дата события в формате {DATE_HINT}?")
+
+
+async def new_event_date(message: Message, state: FSMContext) -> None:
+    event_date = _parse_date(_text(message))
+    if event_date is None:
+        await message.answer(f"Не понял дату. Нужен формат {DATE_HINT}, например 12.07.2010.")
+        return
+    await state.update_data(event_date=event_date.isoformat())
+    await state.set_state(NewEvent.yearly)
+    await message.answer("Отмечается каждый год?", reply_markup=_keyboard(["да", "нет"]))
+
+
+async def new_event_yearly(message: Message, state: FSMContext, deps: Deps) -> None:
+    """Последний шаг: ежегодное событие или разовое (SPEC 4.2), затем вызов сценария."""
+    yearly = _parse_yes_no(_text(message))
+    if yearly is None:
+        await message.answer("Ответьте «да» или «нет».", reply_markup=_keyboard(["да", "нет"]))
+        return
+    account = await _account_of(message, deps)
+    if account is None:
+        await state.clear()
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+    data = await state.get_data()
+    try:
+        event = await services.add_event(
+            account.id,
+            int(data["family_id"]),
+            int(data["person_id"]),
+            str(data["title"]),
+            date.fromisoformat(str(data["event_date"])),
+            yearly,
+            deps.account,
+            deps.event,
+            deps.family,
+            deps.person,
+            deps.membership,
+            deps.reminder,
+            deps.clock,
+            deps.uow,
+        )
+    except services.NotFamilyOwner:
+        await state.clear()
+        await message.answer(
+            "События добавляет владелец семьи. Своё расписание вы меняете сами: /settings",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    except ValueError as error:
+        await state.clear()
+        await message.answer(
+            f"Не получилось добавить событие: {error}", reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    await state.clear()
+    await message.answer(
+        f"Добавил событие: {event.title}. Напоминания уже построены.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def cmd_settings(message: Message, state: FSMContext, deps: Deps) -> None:
+    """Смещения и время суток принадлежат аккаунту и действуют во всех его семьях (SPEC 2.1)."""
+    account = await _account_of(message, deps)
+    if account is None:
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+    await state.set_state(ChangingSettings.offsets)
+    await message.answer(
+        f"Сейчас {_schedule_words(account.offsets_days, account.time_of_day)}.\n\n" + OFFSETS_HINT,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def changing_settings_offsets(message: Message, state: FSMContext) -> None:
+    offsets = _parse_offsets(_text(message))
+    if offsets is None:
+        await message.answer(OFFSETS_NOT_UNDERSTOOD)
+        return
+    await state.update_data(offsets_days=list(offsets))
+    await state.set_state(ChangingSettings.time_of_day)
+    await message.answer(f"Во сколько напоминать? Формат {TIME_HINT}, например 09:00.")
+
+
+async def changing_settings_time(message: Message, state: FSMContext, deps: Deps) -> None:
+    """Пояс не спрашивается: его меняет /timezone, а сценарий требует весь набор настроек."""
+    time_of_day = _parse_time(_text(message))
+    if time_of_day is None:
+        await message.answer(f"Не понял время. Нужен формат {TIME_HINT}, например 09:00.")
+        return
+    account = await _account_of(message, deps)
+    if account is None:
+        await state.clear()
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+    data = await state.get_data()
+    offsets = tuple(int(days) for days in data["offsets_days"])
+    try:
+        updated = await services.update_account_settings(
+            account.id,
+            account.timezone,
+            offsets,
+            time_of_day,
+            deps.account,
+            deps.membership,
+            deps.event,
+            deps.override,
+            deps.reminder,
+            deps.clock,
+            deps.uow,
+        )
+    except ValueError as error:
+        await state.clear()
+        await message.answer(f"Настройки не изменены: {error}", reply_markup=ReplyKeyboardRemove())
+        return
+    await state.clear()
+    await message.answer(
+        f"Готово: {_schedule_words(updated.offsets_days, updated.time_of_day)}.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def cmd_event_settings(message: Message, state: FSMContext, deps: Deps) -> None:
+    """Переопределение по одному событию: своё расписание или возврат к общему (SPEC 5.6)."""
+    family_id = await _current_family_id(message, deps)
+    if family_id is None:
+        return
+    events = await deps.event.list_by_family(family_id)
+    if not events:
+        await message.answer(
+            "В этой семье пока нет событий. Добавьте родственника (/add_person) "
+            "или событие (/add_event).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    labels = await _event_labels(deps, family_id, events)
+    await state.set_state(ChangingEventSettings.event)
+    await state.update_data(family_id=family_id)
+    await message.answer(
+        "Для какого события задать своё расписание?\n" + _numbered(labels),
+        reply_markup=_keyboard([f"{i}. {label}" for i, label in enumerate(labels, 1)], per_row=1),
+    )
+
+
+async def changing_event_settings_event(message: Message, state: FSMContext, deps: Deps) -> None:
+    data = await state.get_data()
+    family_id = int(data["family_id"])
+    events = await deps.event.list_by_family(family_id)
+    labels = await _event_labels(deps, family_id, events)
+    index = _pick(_text(message), len(events))
+    if index is None:
+        await message.answer("Нужен номер из списка.\n" + _numbered(labels))
+        return
+    await state.update_data(event_id=events[index].id)
+    await state.set_state(ChangingEventSettings.mode)
+    await message.answer(
+        f"«{labels[index]}»: задать своё расписание или вернуть общие настройки?",
+        reply_markup=_keyboard([OWN_SETTINGS, ACCOUNT_SETTINGS], per_row=1),
+    )
+
+
+async def changing_event_settings_mode(message: Message, state: FSMContext, deps: Deps) -> None:
+    """Развилка: «свои настройки» ведёт к вопросам, «как в настройках» снимает переопределение.
+
+    Снятие отсутствующего переопределения ядро считает безобидным, поэтому
+    отдельного вопроса «а было ли оно» здесь нет (SPEC 5.6).
+    """
+    answer = _text(message).casefold()
+    if answer.startswith("свои"):
+        await state.set_state(ChangingEventSettings.offsets)
+        await message.answer(OFFSETS_HINT, reply_markup=ReplyKeyboardRemove())
+        return
+    if not answer.startswith("как"):
+        await message.answer(
+            f"Выберите «{OWN_SETTINGS}» или «{ACCOUNT_SETTINGS}».",
+            reply_markup=_keyboard([OWN_SETTINGS, ACCOUNT_SETTINGS], per_row=1),
+        )
+        return
+    account = await _account_of(message, deps)
+    if account is None:
+        await state.clear()
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+    data = await state.get_data()
+    try:
+        await services.clear_override(
+            account.id,
+            int(data["event_id"]),
+            deps.override,
+            deps.event,
+            deps.account,
+            deps.membership,
+            deps.reminder,
+            deps.clock,
+            deps.uow,
+        )
+    except ValueError as error:
+        await state.clear()
+        await message.answer(f"Расписание не изменено: {error}", reply_markup=ReplyKeyboardRemove())
+        return
+    await state.clear()
+    await message.answer(
+        "Вернул общие настройки аккаунта: "
+        f"{_schedule_words(account.offsets_days, account.time_of_day)}.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def changing_event_settings_offsets(message: Message, state: FSMContext) -> None:
+    offsets = _parse_offsets(_text(message))
+    if offsets is None:
+        await message.answer(OFFSETS_NOT_UNDERSTOOD)
+        return
+    await state.update_data(offsets_days=list(offsets))
+    await state.set_state(ChangingEventSettings.time_of_day)
+    await message.answer(f"Во сколько напоминать об этом событии? Формат {TIME_HINT}.")
+
+
+async def changing_event_settings_time(message: Message, state: FSMContext, deps: Deps) -> None:
+    time_of_day = _parse_time(_text(message))
+    if time_of_day is None:
+        await message.answer(f"Не понял время. Нужен формат {TIME_HINT}, например 09:00.")
+        return
+    account = await _account_of(message, deps)
+    if account is None:
+        await state.clear()
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+    data = await state.get_data()
+    offsets = tuple(int(days) for days in data["offsets_days"])
+    try:
+        override = await services.set_override(
+            account.id,
+            int(data["event_id"]),
+            offsets,
+            time_of_day,
+            deps.override,
+            deps.event,
+            deps.account,
+            deps.membership,
+            deps.reminder,
+            deps.clock,
+            deps.uow,
+        )
+    except ValueError as error:
+        await state.clear()
+        await message.answer(f"Расписание не изменено: {error}", reply_markup=ReplyKeyboardRemove())
+        return
+    await state.clear()
+    await message.answer(
+        f"Для этого события {_schedule_words(override.offsets_days, override.time_of_day)}. "
+        "Вернуть общие настройки — снова /event_settings.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -814,8 +1192,11 @@ def build_router() -> Router:
     router.message.register(cmd_new_family, Command("new_family"))
     router.message.register(cmd_join, Command("join"))
     router.message.register(cmd_add_person, Command("add_person"))
+    router.message.register(cmd_add_event, Command("add_event"))
     router.message.register(cmd_invite, Command("invite"))
     router.message.register(cmd_timezone, Command("timezone"))
+    router.message.register(cmd_settings, Command("settings"))
+    router.message.register(cmd_event_settings, Command("event_settings"))
     router.message.register(cmd_family, Command("family"))
 
     router.message.register(new_family_name, NewFamily.name, F.text)
@@ -832,6 +1213,19 @@ def build_router() -> Router:
     router.message.register(new_person_gender, NewPerson.gender, F.text)
     router.message.register(new_person_birth_date, NewPerson.birth_date, F.text)
     router.message.register(new_person_siblings, NewPerson.siblings, F.text)
+
+    router.message.register(new_event_person, NewEvent.person, F.text)
+    router.message.register(new_event_title, NewEvent.title, F.text)
+    router.message.register(new_event_date, NewEvent.event_date, F.text)
+    router.message.register(new_event_yearly, NewEvent.yearly, F.text)
+
+    router.message.register(changing_settings_offsets, ChangingSettings.offsets, F.text)
+    router.message.register(changing_settings_time, ChangingSettings.time_of_day, F.text)
+
+    router.message.register(changing_event_settings_event, ChangingEventSettings.event, F.text)
+    router.message.register(changing_event_settings_mode, ChangingEventSettings.mode, F.text)
+    router.message.register(changing_event_settings_offsets, ChangingEventSettings.offsets, F.text)
+    router.message.register(changing_event_settings_time, ChangingEventSettings.time_of_day, F.text)
 
     router.message.register(issuing_invite_person, IssuingInvite.person, F.text)
     router.message.register(changing_timezone_city, ChangingTimezone.city, F.text)
