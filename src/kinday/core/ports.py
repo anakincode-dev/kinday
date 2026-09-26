@@ -117,11 +117,15 @@ class ReminderRepo(Protocol):
         """
         ...
 
-    async def fail_all_sending(self, at: datetime) -> None:
+    async def fail_all_sending(self, at: datetime) -> int:
         """При старте сервиса переводит все строки sending в failed (SPEC 5.5).
 
         `at` — момент перехода, как у mark_failed: строки остались от прошлого
         запуска, и когда именно их закрыли, из самих строк иначе не узнать.
+
+        Возвращает число закрытых строк: SPEC 5.5 требует записи в журнал, а
+        она имеет смысл только с количеством — каждая такая строка это
+        сообщение, про которое неизвестно, дошло ли оно.
         """
         ...
 
@@ -163,6 +167,14 @@ class EventRepo(Protocol):
     async def delete(self, event_id: int) -> None: ...
     async def list_by_family(self, family_id: int) -> list[Event]: ...
     async def list_by_person(self, person_id: int) -> list[Event]: ...
+
+    async def list_all(self) -> list[Event]:
+        """Все события всех семей — нужно суточной материализации (SPEC 5.4).
+
+        Она достраивает напоминания по всем событиям сразу и семьи не выбирает:
+        обход по списку семей означал бы ещё один порт ради того же самого.
+        """
+        ...
 
 
 class RelationRepo(Protocol):

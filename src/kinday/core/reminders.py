@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from kinday.core.models import Account, Event, Membership, Reminder
+from kinday.core.models import Account, Event, Membership, Reminder, ReminderOverride
 from kinday.core.ports import Clock
 from kinday.core.recurrence import next_occurrence
 
@@ -45,6 +46,31 @@ def _localize_forward(naive: datetime, tz: ZoneInfo) -> datetime:
         candidate += _GAP_SEARCH_STEP
         searched += _GAP_SEARCH_STEP
     raise ValueError(f"Не удалось локализовать {naive} в {tz.key}: несуществующий момент")
+
+
+def apply_override(account: Account, override: ReminderOverride | None) -> Account:
+    """Настройки пары «аккаунт и событие»: переопределение перекрывает смещения и время суток.
+
+    Возвращает копию аккаунта, а не правит его: значения нужны только для
+    расчёта моментов отправки, в хранилище настройки аккаунта остаются прежними
+    (SPEC 5.6 — переопределение не должно теряться при смене общих настроек и
+    не должно их подменять).
+    """
+    if override is None:
+        return account
+    return replace(account, offsets_days=override.offsets_days, time_of_day=override.time_of_day)
+
+
+def is_overdue(reminder: Reminder, now: datetime, timezone: str) -> bool:
+    """SPEC 5.5: просрочка — срок старше MISFIRE_GRACE или дата наступления уже прошла.
+
+    Второе условие проверяется по дате в поясе получателя: напоминание «в день
+    события», ушедшее бы на следующий день, говорило бы о прошедшем событии,
+    даже если по UTC сутки ещё не сменились.
+    """
+    if now - reminder.due_at_utc > timedelta(seconds=MISFIRE_GRACE):
+        return True
+    return reminder.occurrence_date < now.astimezone(ZoneInfo(timezone)).date()
 
 
 def materialize_for_event(

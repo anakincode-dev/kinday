@@ -475,6 +475,12 @@ class SqliteEventRepo:
         )
         return [_event(row) for row in rows]
 
+    async def list_all(self) -> list[Event]:
+        rows = await self._database.run(
+            lambda c: c.execute("SELECT * FROM events ORDER BY id").fetchall()
+        )
+        return [_event(row) for row in rows]
+
 
 class SqliteRelationRepo:
     """Реализация core.ports.RelationRepo."""
@@ -785,10 +791,11 @@ class SqliteReminderRepo:
             lambda c: c.execute("DELETE FROM reminders WHERE person_id = ?", (person_id,))
         )
 
-    async def fail_all_sending(self, at: datetime) -> None:
+    async def fail_all_sending(self, at: datetime) -> int:
         """SPEC 5.5: строки, застрявшие в sending после падения, повторно не отправляются."""
-        await self._database.run(
-            lambda c: c.execute(
+
+        def work(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
                 """
                 UPDATE reminders
                    SET status = 'failed', status_changed_at = ?
@@ -796,4 +803,6 @@ class SqliteReminderRepo:
                 """,
                 (dump_datetime(at),),
             )
-        )
+            return cursor.rowcount
+
+        return await self._database.run(work)

@@ -16,7 +16,7 @@ tests/storage/test_scenarios.py и проходят на обоих бэкенд
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from types import TracebackType
 
@@ -52,6 +52,28 @@ class FixedClock:
 
     def now(self) -> datetime:
         return self._now
+
+    def move_to(self, now: datetime) -> None:
+        """Переводит часы: тесты двигают время подменой, а не `sleep` (SPEC 5.2)."""
+        self._now = now
+
+
+@dataclass
+class RecordingNotifier:
+    """Подмена Notifier: складывает сообщения в список вместо отправки в Telegram.
+
+    `error` заставляет `send` поднимать заданное исключение — так тесты
+    проигрывают 403 (`RecipientBlocked`) и сетевой сбой (`TransportError`),
+    не зная ничего о самом транспорте.
+    """
+
+    sent: list[tuple[int, str]] = field(default_factory=list)
+    error: Exception | None = None
+
+    async def send(self, chat_id: int, text: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append((chat_id, text))
 
 
 @dataclass
@@ -173,6 +195,9 @@ class FakeEventRepo:
     async def list_by_person(self, person_id: int) -> list[Event]:
         return [e for e in self.events.values() if e.person_id == person_id]
 
+    async def list_all(self) -> list[Event]:
+        return sorted(self.events.values(), key=lambda e: e.id)
+
 
 @dataclass
 class FakeRelationRepo:
@@ -191,21 +216,43 @@ class FakeRelationRepo:
 @dataclass
 class FakeReminderRepo:
     reminders: list[Reminder] = field(default_factory=list)
+    _next_id: int = 1
+
+    def _by_id(self, reminder_id: int) -> Reminder:
+        return next(r for r in self.reminders if r.id == reminder_id)
 
     async def claim_due(self, at: datetime, limit: int) -> list[Reminder]:
-        raise NotImplementedError
+        """Повторяет условный UPDATE из SPEC 5.5: забирается только pending.
+
+        Порядок — по сроку, как в SQLite, и наружу уходят копии: в настоящем
+        хранилище тик держит в руках снимок строки, а не саму строку, и правки
+        статуса идут только через методы репозитория.
+        """
+        claimed: list[Reminder] = []
+        for reminder in sorted(self.reminders, key=lambda r: (r.due_at_utc, r.id)):
+            if len(claimed) >= limit:
+                break
+            if reminder.status != ReminderStatus.PENDING or reminder.due_at_utc > at:
+                continue
+            reminder.status = ReminderStatus.SENDING
+            claimed.append(replace(reminder))
+        return claimed
 
     async def mark_sent(self, reminder_id: int, at: datetime) -> None:
-        raise NotImplementedError
+        reminder = self._by_id(reminder_id)
+        reminder.status = ReminderStatus.SENT
+        reminder.sent_at = at
 
     async def mark_missed(self, reminder_id: int, at: datetime) -> None:
-        raise NotImplementedError
+        self._by_id(reminder_id).status = ReminderStatus.MISSED
 
     async def mark_failed(self, reminder_id: int, at: datetime) -> None:
-        raise NotImplementedError
+        self._by_id(reminder_id).status = ReminderStatus.FAILED
 
     async def release(self, reminder_id: int) -> None:
-        raise NotImplementedError
+        reminder = self._by_id(reminder_id)
+        reminder.status = ReminderStatus.PENDING
+        reminder.attempts += 1
 
     async def add_many(self, reminders: list[Reminder]) -> None:
         """Эмулирует уникальный индекс SPEC 5.3, а не просто расширяет список.
@@ -219,6 +266,8 @@ class FakeReminderRepo:
         """
         for reminder in reminders:
             if not any(_unique_key(r) == _unique_key(reminder) for r in self.reminders):
+                reminder.id = self._next_id
+                self._next_id += 1
                 self.reminders.append(reminder)
 
     async def delete_future_pending_for_event(self, event_id: int, after: datetime) -> None:
@@ -263,8 +312,13 @@ class FakeReminderRepo:
     async def delete_all_for_person(self, person_id: int) -> None:
         self.reminders = [r for r in self.reminders if r.person_id != person_id]
 
-    async def fail_all_sending(self, at: datetime) -> None:
-        raise NotImplementedError
+    async def fail_all_sending(self, at: datetime) -> int:
+        closed = 0
+        for reminder in self.reminders:
+            if reminder.status == ReminderStatus.SENDING:
+                reminder.status = ReminderStatus.FAILED
+                closed += 1
+        return closed
 
 
 @dataclass
