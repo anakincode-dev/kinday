@@ -26,6 +26,7 @@ from kinday.storage.repos import (
     SqliteReminderRepo,
     SqliteUnitOfWork,
 )
+from kinday.telegram.errors import silence_aiogram_update_dump
 from kinday.telegram.routers import Deps, build_router
 
 
@@ -56,7 +57,13 @@ def build_dispatcher(deps: Deps) -> Dispatcher:
     `deps` уходит в данные Dispatcher: aiogram передаёт их в handler'ы по имени
     параметра, поэтому роутеры остаются обычными функциями без глобального
     состояния.
+
+    Здесь же приглушается штатный журнал aiogram: свой обработчик ошибок
+    (`telegram/errors.py`) пишет тип сбоя, update_id и id пользователя, а
+    родной дубль печатал бы вместе с ними трассировку и `str(ошибки)`, куда
+    попадает написанное человеком.
     """
+    silence_aiogram_update_dump()
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher["deps"] = deps
     dispatcher.include_router(build_router())

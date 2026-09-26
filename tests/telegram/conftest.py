@@ -66,7 +66,7 @@ class FakeTelegram:
         self.bot = bot
         self.dispatcher = dispatcher
         self.session = session
-        self._update_id = 0
+        self.last_update_id = 0
         self.sent: list[tuple[int, str]] = []
 
     async def send(
@@ -83,12 +83,12 @@ class FakeTelegram:
         принимают, и тест проверяет, что бот всё равно отвечает. `chat_type` нужен
         групповому чату: бот работает только в личных сообщениях (SPEC 7).
         """
-        self._update_id += 1
+        self.last_update_id += 1
         chat = chat_id if chat_id is not None else user_id
         update = Update(
-            update_id=self._update_id,
+            update_id=self.last_update_id,
             message=Message(
-                message_id=self._update_id,
+                message_id=self.last_update_id,
                 date=datetime(2027, 1, 1, tzinfo=UTC),
                 chat=Chat(id=chat, type=chat_type),
                 from_user=User(id=user_id, is_bot=False, first_name=f"user{user_id}"),

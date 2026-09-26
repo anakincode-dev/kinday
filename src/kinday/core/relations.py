@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from kinday.core.errors import DomainError, DomainErrorCode
 from kinday.core.models import ParentOf, Person, Relation, SpouseOf
 from kinday.core.texts import relation_word
 
@@ -91,7 +92,9 @@ def _touches(relation: Relation, person_id: int) -> bool:
 
 def _check_parent_slot_free(person_id: int, relations: list[ParentOf]) -> None:
     if len(_parent_ids(person_id, relations)) >= MAX_PARENTS:
-        raise ValueError(f"У человека {person_id} уже есть двое родителей")
+        raise DomainError(
+            DomainErrorCode.THIRD_PARENT, f"У человека {person_id} уже есть двое родителей"
+        )
 
 
 def add_parent(person_id: int, new_parent_id: int, relations: list[ParentOf]) -> ParentOf:
@@ -104,7 +107,9 @@ def add_parent(person_id: int, new_parent_id: int, relations: list[ParentOf]) ->
     вместо слияния с ним. Отклоняет попытку сделать человека родителем самому себе.
     """
     if person_id == new_parent_id:
-        raise ValueError("Человек не может быть родителем самому себе")
+        raise DomainError(
+            DomainErrorCode.SELF_RELATION, "Человек не может быть родителем самому себе"
+        )
     _check_parent_slot_free(person_id, relations)
     return ParentOf(parent_id=new_parent_id, child_id=person_id)
 
@@ -118,7 +123,9 @@ def add_child(person_id: int, new_child_id: int, relations: list[ParentOf]) -> P
     Отклоняет попытку сделать человека своим собственным ребёнком.
     """
     if person_id == new_child_id:
-        raise ValueError("Человек не может быть своим собственным ребёнком")
+        raise DomainError(
+            DomainErrorCode.SELF_RELATION, "Человек не может быть своим собственным ребёнком"
+        )
     _check_parent_slot_free(new_child_id, relations)
     return ParentOf(parent_id=person_id, child_id=new_child_id)
 
@@ -129,7 +136,9 @@ def add_spouse(person_id: int, new_spouse_id: int) -> SpouseOf:
     Отклоняет попытку сделать человека супругом самому себе.
     """
     if person_id == new_spouse_id:
-        raise ValueError("Человек не может быть супругом самому себе")
+        raise DomainError(
+            DomainErrorCode.SELF_RELATION, "Человек не может быть супругом самому себе"
+        )
     return SpouseOf(a_id=person_id, b_id=new_spouse_id)
 
 
@@ -161,6 +170,8 @@ def add_sibling(
         return SiblingAttachment(placeholder=None, edges=edges)
 
     if placeholder_id is None or family_id is None:
+        # Не доменный отказ, а нарушенный контракт вызова: кода для пользователя нет,
+        # слой telegram ответит на такое общим текстом.
         raise ValueError(
             f"У человека {person_id} нет родителей: нужны family_id и placeholder_id для заглушки"
         )
@@ -219,14 +230,16 @@ def merge_placeholder_into(
             own_parents.append(relation.parent_id)
 
     if real_parent_id in parents_above:
-        raise ValueError(
+        raise DomainError(
+            DomainErrorCode.SELF_RELATION,
             f"Заглушка {placeholder_id} — ребёнок человека {real_parent_id}: "
-            "слияние сделало бы его родителем самому себе"
+            "слияние сделало бы его родителем самому себе",
         )
     if len({*own_parents, *parents_above}) > MAX_PARENTS:
-        raise ValueError(
+        raise DomainError(
+            DomainErrorCode.THIRD_PARENT,
             f"После слияния с заглушкой {placeholder_id} у человека "
-            f"{real_parent_id} оказалось бы больше {MAX_PARENTS} родителей"
+            f"{real_parent_id} оказалось бы больше {MAX_PARENTS} родителей",
         )
 
     moved: list[Relation] = []
@@ -282,7 +295,9 @@ def attach_parent(
     человека родителем самому себе.
     """
     if person_id == new_parent_id:
-        raise ValueError("Человек не может быть родителем самому себе")
+        raise DomainError(
+            DomainErrorCode.SELF_RELATION, "Человек не может быть родителем самому себе"
+        )
     parent_relations = [r for r in relations if isinstance(r, ParentOf)]
     existing_parent_ids = _parent_ids(person_id, parent_relations)
 
@@ -300,7 +315,9 @@ def attach_parent(
         return ParentChange(added=[edge], removed=[], removed_placeholder_id=None)
 
     if len(existing_parent_ids) >= MAX_PARENTS:
-        raise ValueError(f"У человека {person_id} уже есть двое родителей")
+        raise DomainError(
+            DomainErrorCode.THIRD_PARENT, f"У человека {person_id} уже есть двое родителей"
+        )
 
     only_parent_id = existing_parent_ids[0]
     all_siblings = sorted(
