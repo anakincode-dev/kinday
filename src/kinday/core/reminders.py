@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from kinday.core.errors import DomainError, DomainErrorCode
 from kinday.core.models import Account, Event, Membership, Reminder, ReminderOverride
 from kinday.core.ports import Clock
 from kinday.core.recurrence import next_occurrence
@@ -45,7 +46,10 @@ def _localize_forward(naive: datetime, tz: ZoneInfo) -> datetime:
             return aware
         candidate += _GAP_SEARCH_STEP
         searched += _GAP_SEARCH_STEP
-    raise ValueError(f"Не удалось локализовать {naive} в {tz.key}: несуществующий момент")
+    raise DomainError(
+        DomainErrorCode.NONEXISTENT_LOCAL_TIME,
+        f"Не удалось локализовать {naive} в {tz.key}: несуществующий момент",
+    )
 
 
 def apply_override(account: Account, override: ReminderOverride | None) -> Account:

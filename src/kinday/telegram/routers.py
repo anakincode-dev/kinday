@@ -40,6 +40,7 @@ from kinday.core.ports import (
 )
 from kinday.core.relations import RelationKind, SiblingsQuestionRequired
 from kinday.telegram.cities import CITIES
+from kinday.telegram.errors import on_error, user_text
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +353,7 @@ async def _bind_chat(message: Message, deps: Deps, telegram_user_id: int) -> boo
         )
     except ValueError as error:
         logger.warning("Не удалось включить доставку аккаунту %s: %s", account.id, error)
-        await message.answer(f"Напоминания пока не включены: {error}. Пришлите /start ещё раз.")
+        await message.answer("Напоминания пока не включены — пришлите /start ещё раз.")
         return False
     return True
 
@@ -474,7 +475,7 @@ async def new_family_city(message: Message, state: FSMContext, deps: Deps) -> No
             deps.uow,
         )
     except ValueError as error:
-        await message.answer(f"Не получилось создать семью: {error}")
+        await message.answer(f"Не получилось создать семью. {user_text(error)}")
         return
     await state.clear()
     await _bind_chat(message, deps, message.from_user.id)
@@ -528,9 +529,7 @@ async def _begin_joining(message: Message, state: FSMContext, deps: Deps, code: 
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(
-            f"Приглашение не подходит: {error}", reply_markup=ReplyKeyboardRemove()
-        )
+        await message.answer(user_text(error), reply_markup=ReplyKeyboardRemove())
         return
     await state.set_state(Joining.city)
     await state.update_data(code=code)
@@ -570,7 +569,7 @@ async def joining_city(message: Message, state: FSMContext, deps: Deps) -> None:
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Приглашение не принято: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(user_text(error), reply_markup=ReplyKeyboardRemove())
         return
     await _bind_chat(message, deps, message.from_user.id)
     await state.clear()
@@ -712,7 +711,9 @@ async def _try_add_person(
         return
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Не получилось добавить: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Не получилось добавить. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -811,7 +812,8 @@ async def new_event_yearly(message: Message, state: FSMContext, deps: Deps) -> N
     except ValueError as error:
         await state.clear()
         await message.answer(
-            f"Не получилось добавить событие: {error}", reply_markup=ReplyKeyboardRemove()
+            f"Не получилось добавить событие. {user_text(error)}",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
     await state.clear()
@@ -873,7 +875,9 @@ async def changing_settings_time(message: Message, state: FSMContext, deps: Deps
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Настройки не изменены: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Настройки не изменены. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -958,7 +962,9 @@ async def changing_event_settings_mode(message: Message, state: FSMContext, deps
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Расписание не изменено: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Расписание не изменено. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -1006,7 +1012,9 @@ async def changing_event_settings_time(message: Message, state: FSMContext, deps
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Расписание не изменено: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Расписание не изменено. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -1060,7 +1068,9 @@ async def issuing_invite_person(message: Message, state: FSMContext, deps: Deps,
         return
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Приглашение не выдано: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Приглашение не выдано. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     me = await bot.me()
@@ -1111,7 +1121,9 @@ async def changing_timezone_city(message: Message, state: FSMContext, deps: Deps
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Настройки не изменены: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Настройки не изменены. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -1156,7 +1168,9 @@ async def choosing_family(message: Message, state: FSMContext, deps: Deps) -> No
         )
     except ValueError as error:
         await state.clear()
-        await message.answer(f"Не переключил: {error}", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            f"Не переключил. {user_text(error)}", reply_markup=ReplyKeyboardRemove()
+        )
         return
     await state.clear()
     await message.answer(
@@ -1235,4 +1249,10 @@ def build_router() -> Router:
     # на шаге диалога (стикер вместо даты). Молчать нельзя — пользователь не
     # поймёт, что бот ждёт другого, и не вспомнит про /cancel.
     router.message.register(fallback)
+
+    # Всё, что не предусмотрел ни один handler. Регистрируется здесь, а не на
+    # Dispatcher, чтобы роутер оставался самодостаточным: собрали — значит, и
+    # сбои уже накрыты. Фильтр `private` на этот observer не действует, он
+    # относится только к сообщениям.
+    router.errors.register(on_error)
     return router

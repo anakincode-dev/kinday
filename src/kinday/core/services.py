@@ -17,6 +17,7 @@ from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from kinday.core.errors import DomainError, DomainErrorCode
 from kinday.core.models import (
     BIRTHDAY_EVENT_TITLE,
     Account,
@@ -131,7 +132,9 @@ def _require_known_timezone(timezone: str) -> None:
     try:
         ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError, TypeError) as error:
-        raise ValueError(f"Неизвестный часовой пояс: {timezone!r}") from error
+        raise DomainError(
+            DomainErrorCode.BAD_TIMEZONE, f"Неизвестный часовой пояс: {timezone!r}"
+        ) from error
 
 
 def _require_valid_offsets(offsets_days: tuple[int, ...]) -> None:
@@ -144,16 +147,23 @@ def _require_valid_offsets(offsets_days: tuple[int, ...]) -> None:
     Отрицательное смещение означало бы напоминание после события.
     """
     if not offsets_days:
-        raise ValueError("Набор смещений не может быть пустым")
+        raise DomainError(DomainErrorCode.BAD_OFFSETS, "Набор смещений не может быть пустым")
     for offset in offsets_days:
         # bool — подкласс int, но True вместо 1 в настройках означает ошибку
         # вызывающего слоя, а не смещение «за один день».
         if isinstance(offset, bool) or not isinstance(offset, int):
-            raise ValueError(f"Смещение должно быть целым числом дней: {offset!r}")
+            raise DomainError(
+                DomainErrorCode.BAD_OFFSETS, f"Смещение должно быть целым числом дней: {offset!r}"
+            )
         if not 0 <= offset <= MAX_OFFSET_DAYS:
-            raise ValueError(f"Смещение вне диапазона 0..{MAX_OFFSET_DAYS}: {offset}")
+            raise DomainError(
+                DomainErrorCode.BAD_OFFSETS,
+                f"Смещение вне диапазона 0..{MAX_OFFSET_DAYS}: {offset}",
+            )
     if len(set(offsets_days)) != len(offsets_days):
-        raise ValueError(f"Смещения не могут повторяться: {offsets_days}")
+        raise DomainError(
+            DomainErrorCode.BAD_OFFSETS, f"Смещения не могут повторяться: {offsets_days}"
+        )
 
 
 async def _require_owner(family_repo: FamilyRepo, family_id: int, acting_account_id: int) -> Family:
@@ -344,11 +354,15 @@ async def add_person(
         parent_relations = [r for r in all_relations if isinstance(r, ParentOf)]
         people = {p.id: p for p in await person_repo.list_by_family(family_id)}
         if relative_to_person_id not in people:
-            raise ValueError(f"Человек {relative_to_person_id} не найден в семье {family_id}")
+            raise DomainError(
+                DomainErrorCode.PERSON_NOT_IN_FAMILY,
+                f"Человек {relative_to_person_id} не найден в семье {family_id}",
+            )
         if people[relative_to_person_id].is_placeholder:
-            raise ValueError(
+            raise DomainError(
+                DomainErrorCode.PLACEHOLDER,
                 f"Запись {relative_to_person_id} — заглушка неизвестного родителя, "
-                "родственником её выбрать нельзя"
+                "родственником её выбрать нельзя",
             )
 
         match relation_kind:
@@ -500,8 +514,9 @@ async def update_person(
         person = await person_repo.get(person_id)
         await _require_owner(family_repo, person.family_id, acting_account_id)
         if person.is_placeholder:
-            raise ValueError(
-                f"Запись {person_id} — заглушка неизвестного родителя, не редактируется"
+            raise DomainError(
+                DomainErrorCode.PLACEHOLDER,
+                f"Запись {person_id} — заглушка неизвестного родителя, не редактируется",
             )
 
         birth_date_changed = person.birth_date != birth_date
@@ -581,7 +596,10 @@ async def delete_person(
 
         own = await membership_repo.get_by_account_and_family(acting_account_id, person.family_id)
         if own is not None and own.person_id == person_id:
-            raise ValueError(f"Аккаунт {acting_account_id} не может удалить собственную запись")
+            raise DomainError(
+                DomainErrorCode.OWN_RECORD,
+                f"Аккаунт {acting_account_id} не может удалить собственную запись",
+            )
 
         now = clock.now()
         for invite in await invite_repo.list_by_person(person_id):
@@ -722,11 +740,14 @@ async def issue_invite(
         await _require_owner(family_repo, person.family_id, acting_account_id)
 
         if person.is_placeholder:
-            raise ValueError(
-                f"Запись {person_id} — заглушка неизвестного родителя, не приглашается"
+            raise DomainError(
+                DomainErrorCode.PLACEHOLDER,
+                f"Запись {person_id} — заглушка неизвестного родителя, не приглашается",
             )
         if await membership_repo.get_by_person(person_id) is not None:
-            raise ValueError(f"Запись {person_id} уже привязана к аккаунту")
+            raise DomainError(
+                DomainErrorCode.ALREADY_LINKED, f"Запись {person_id} уже привязана к аккаунту"
+            )
 
         now = clock.now()
         return await invite_repo.create(
@@ -759,7 +780,9 @@ async def revoke_invite(
         invite = await invite_repo.get(invite_id)
         await _require_owner(family_repo, invite.family_id, acting_account_id)
         if invite.used_at is not None:
-            raise ValueError(f"Приглашение {invite_id} уже использовано")
+            raise DomainError(
+                DomainErrorCode.INVITE_USED, f"Приглашение {invite_id} уже использовано"
+            )
         await invite_repo.revoke(invite_id, clock.now())
 
 
@@ -772,13 +795,13 @@ def _require_usable_invite(invite: Invite | None, now: datetime) -> Invite:
     коду, который сценарий всё равно не примет.
     """
     if invite is None:
-        raise ValueError("Приглашение не найдено")
+        raise DomainError(DomainErrorCode.INVITE_NOT_FOUND, "Приглашение не найдено")
     if invite.revoked_at is not None:
-        raise ValueError("Приглашение отозвано")
+        raise DomainError(DomainErrorCode.INVITE_REVOKED, "Приглашение отозвано")
     if invite.used_at is not None:
-        raise ValueError("Приглашение уже использовано")
+        raise DomainError(DomainErrorCode.INVITE_USED, "Приглашение уже использовано")
     if now > invite.expires_at:
-        raise ValueError("Приглашение просрочено")
+        raise DomainError(DomainErrorCode.INVITE_EXPIRED, "Приглашение просрочено")
     return invite
 
 
@@ -794,9 +817,15 @@ async def _require_invited_person(invite: Invite, person_repo: PersonRepo) -> Pe
         None,
     )
     if person is None:
-        raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
+        raise DomainError(
+            DomainErrorCode.INVITED_PERSON_GONE,
+            f"Запись {invite.person_id} не найдена — приглашение недействительно",
+        )
     if person.is_placeholder:
-        raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
+        raise DomainError(
+            DomainErrorCode.PLACEHOLDER,
+            f"Запись {invite.person_id} — заглушка неизвестного родителя",
+        )
     return person
 
 
@@ -834,7 +863,9 @@ async def preview_invite(
     """
     invite = _require_usable_invite(await invite_repo.get_by_code(code), clock.now())
     if await membership_repo.get_by_person(invite.person_id) is not None:
-        raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+        raise DomainError(
+            DomainErrorCode.ALREADY_LINKED, f"Запись {invite.person_id} уже привязана к аккаунту"
+        )
     person = await _require_invited_person(invite, person_repo)
 
     account = await account_repo.get_by_telegram_user_id(telegram_user_id)
@@ -843,7 +874,10 @@ async def preview_invite(
         and await membership_repo.get_by_account_and_family(account.id, invite.family_id)
         is not None
     ):
-        raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+        raise DomainError(
+            DomainErrorCode.ALREADY_IN_FAMILY,
+            f"Аккаунт {account.id} уже состоит в семье {invite.family_id}",
+        )
 
     family = await family_repo.get(invite.family_id)
     owner = await membership_repo.get_by_account_and_family(
@@ -922,7 +956,10 @@ async def accept_invite(
         now = clock.now()
         invite = _require_usable_invite(await invite_repo.get_by_code(code), now)
         if await membership_repo.get_by_person(invite.person_id) is not None:
-            raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+            raise DomainError(
+                DomainErrorCode.ALREADY_LINKED,
+                f"Запись {invite.person_id} уже привязана к аккаунту",
+            )
         person = await _require_invited_person(invite, person_repo)
 
         account = await account_repo.get_by_telegram_user_id(telegram_user_id)
@@ -941,7 +978,10 @@ async def accept_invite(
             await membership_repo.get_by_account_and_family(account.id, invite.family_id)
             is not None
         ):
-            raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+            raise DomainError(
+                DomainErrorCode.ALREADY_IN_FAMILY,
+                f"Аккаунт {account.id} уже состоит в семье {invite.family_id}",
+            )
 
         membership = await membership_repo.create(
             Membership(
@@ -999,10 +1039,14 @@ async def add_event(
 
         person = await person_repo.get(person_id)
         if person.family_id != family_id:
-            raise ValueError(f"Человек {person_id} не принадлежит семье {family_id}")
+            raise DomainError(
+                DomainErrorCode.PERSON_NOT_IN_FAMILY,
+                f"Человек {person_id} не принадлежит семье {family_id}",
+            )
         if person.is_placeholder:
-            raise ValueError(
-                f"Запись {person_id} — заглушка неизвестного родителя, событий не имеет"
+            raise DomainError(
+                DomainErrorCode.PLACEHOLDER,
+                f"Запись {person_id} — заглушка неизвестного родителя, событий не имеет",
             )
 
         event = await event_repo.create(
@@ -1108,7 +1152,10 @@ async def set_override(
         event = await event_repo.get(event_id)
         membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
         if membership is None:
-            raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
+            raise DomainError(
+                DomainErrorCode.NOT_MEMBER,
+                f"Аккаунт {account_id} не состоит в семье {event.family_id}",
+            )
 
         override = ReminderOverride(
             account_id=account_id,
@@ -1159,7 +1206,10 @@ async def clear_override(
         event = await event_repo.get(event_id)
         membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
         if membership is None:
-            raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
+            raise DomainError(
+                DomainErrorCode.NOT_MEMBER,
+                f"Аккаунт {account_id} не состоит в семье {event.family_id}",
+            )
 
         if await override_repo.get(account_id, event_id) is None:
             return
@@ -1184,7 +1234,10 @@ async def set_current_family(
     """
     async with uow:
         if await membership_repo.get_by_account_and_family(account_id, family_id) is None:
-            raise ValueError(f"Аккаунт {account_id} не состоит в семье {family_id}")
+            raise DomainError(
+                DomainErrorCode.NOT_MEMBER,
+                f"Аккаунт {account_id} не состоит в семье {family_id}",
+            )
 
         account = await account_repo.get(account_id)
         account.current_family_id = family_id
