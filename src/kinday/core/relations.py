@@ -67,15 +67,26 @@ class SiblingsQuestionRequired(Exception):
 
 @dataclass(slots=True)
 class ParentChange:
-    """Результат attach_parent: что добавить и что убрать из хранилища рёбер."""
+    """Результат attach_parent: что добавить и что убрать из хранилища рёбер.
 
-    added: list[ParentOf]
-    removed: list[ParentOf]
+    Рёбра любого вида, а не только parent_of: в ветке со слиянием заглушки
+    сюда попадают и её супружеские рёбра (merge_placeholder_into).
+    """
+
+    added: list[Relation]
+    removed: list[Relation]
     removed_placeholder_id: int | None
 
 
-def _parent_ids(person_id: int, relations: list[ParentOf]) -> list[int]:
+def _parent_ids(person_id: int, relations: Sequence[ParentOf]) -> list[int]:
     return [r.parent_id for r in relations if r.child_id == person_id]
+
+
+def _touches(relation: Relation, person_id: int) -> bool:
+    """Ребро упирается в person_id любым концом — в любую сторону и любого вида."""
+    if isinstance(relation, ParentOf):
+        return person_id in (relation.parent_id, relation.child_id)
+    return person_id in (relation.a_id, relation.b_id)
 
 
 def _check_parent_slot_free(person_id: int, relations: list[ParentOf]) -> None:
@@ -181,24 +192,60 @@ def create_placeholder_parent(
 
 
 def merge_placeholder_into(
-    placeholder_id: int, real_parent_id: int, relations: list[ParentOf]
-) -> list[ParentOf]:
+    placeholder_id: int, real_parent_id: int, relations: Sequence[Relation]
+) -> list[Relation]:
     """Первый добавленный настоящий родитель занимает место заглушки.
 
-    Возвращает рёбра заглушки, переписанные на real_parent_id; сама заглушка
-    удаляется вызывающим кодом.
+    Возвращает все рёбра заглушки, переписанные на real_parent_id: к её детям,
+    к её собственным родителям и к её супругу. Сама заглушка со всеми своими
+    рёбрами удаляется вызывающим кодом, поэтому перенести нужно каждое: рёбра
+    вверх и к супругу заглушка получает, когда в неё превратился удалённый
+    человек с детьми (SPEC 4.3), и именно они держат родство внука с дедом.
+    Оставить их без переноса значило бы молча его потерять.
+
+    Отказывает, если у настоящего родителя после переноса оказалось бы больше
+    MAX_PARENTS родителей: два своих плюс родители заглушки не поместятся, а
+    выбрасывать лишнее по своему усмотрению функция не вправе. Общий родитель
+    заглушки и настоящего родителя переносится один раз, без дубля ребра.
     """
-    return [
-        ParentOf(parent_id=real_parent_id, child_id=r.child_id)
-        for r in relations
-        if r.parent_id == placeholder_id
-    ]
+    parents_above: list[int] = []
+    own_parents: list[int] = []
+    for relation in relations:
+        if not isinstance(relation, ParentOf):
+            continue
+        if relation.child_id == placeholder_id:
+            parents_above.append(relation.parent_id)
+        elif relation.child_id == real_parent_id:
+            own_parents.append(relation.parent_id)
+
+    if real_parent_id in parents_above:
+        raise ValueError(
+            f"Заглушка {placeholder_id} — ребёнок человека {real_parent_id}: "
+            "слияние сделало бы его родителем самому себе"
+        )
+    if len({*own_parents, *parents_above}) > MAX_PARENTS:
+        raise ValueError(
+            f"После слияния с заглушкой {placeholder_id} у человека "
+            f"{real_parent_id} оказалось бы больше {MAX_PARENTS} родителей"
+        )
+
+    moved: list[Relation] = []
+    for relation in relations:
+        if isinstance(relation, ParentOf):
+            if relation.parent_id == placeholder_id:
+                moved.append(ParentOf(parent_id=real_parent_id, child_id=relation.child_id))
+            elif relation.child_id == placeholder_id and relation.parent_id not in own_parents:
+                moved.append(ParentOf(parent_id=relation.parent_id, child_id=real_parent_id))
+        elif placeholder_id in (relation.a_id, relation.b_id):
+            spouse_id = relation.b_id if relation.a_id == placeholder_id else relation.a_id
+            moved.append(add_spouse(real_parent_id, spouse_id))
+    return moved
 
 
 def attach_parent(
     person_id: int,
     new_parent_id: int,
-    relations: list[ParentOf],
+    relations: Sequence[Relation],
     also_parent_of_siblings: bool | None,
     people: dict[int, Person],
 ) -> ParentChange:
@@ -212,6 +259,9 @@ def attach_parent(
     - Среди родителей person_id есть заглушка → она сливается с new_parent_id
       (merge_placeholder_into); вопрос про братьев и сестёр не нужен — они
       уже висят на заглушке и получат правильного родителя вместе с ней.
+      В `removed` попадают все рёбра заглушки, включая супружеские и рёбра к
+      её собственным родителям: настоящий родитель получает их копии в
+      `added`, а сама заглушка удаляется вызывающим кодом.
     - Родителей нет → одно ребро parent_of(new_parent_id, person_id).
     - Один настоящий родитель:
       - если среди других детей этого родителя (братьев и сестёр person_id)
@@ -225,20 +275,23 @@ def attach_parent(
         вопрос не нужен (спрашивать не о чем), ребро сразу к person_id.
     - Двое родителей (оба настоящие) → отказ (SPEC 4.1, критерий 21).
 
-    `people` должен содержать запись для каждого id, уже фигурирующего как
-    родитель person_id в `relations` — иначе поиск заглушки среди них упадёт
-    с KeyError. Отклоняет попытку сделать человека родителем самому себе.
+    `relations` — все рёбра семьи, а не только parent_of: слияние заглушки
+    переносит и её супружеское ребро. `people` должен содержать запись для
+    каждого id, уже фигурирующего как родитель person_id в `relations` — иначе
+    поиск заглушки среди них упадёт с KeyError. Отклоняет попытку сделать
+    человека родителем самому себе.
     """
     if person_id == new_parent_id:
         raise ValueError("Человек не может быть родителем самому себе")
-    existing_parent_ids = _parent_ids(person_id, relations)
+    parent_relations = [r for r in relations if isinstance(r, ParentOf)]
+    existing_parent_ids = _parent_ids(person_id, parent_relations)
 
     placeholder_id = next(
         (parent_id for parent_id in existing_parent_ids if people[parent_id].is_placeholder),
         None,
     )
     if placeholder_id is not None:
-        removed = [r for r in relations if r.parent_id == placeholder_id]
+        removed = [r for r in relations if _touches(r, placeholder_id)]
         added = merge_placeholder_into(placeholder_id, new_parent_id, relations)
         return ParentChange(added=added, removed=removed, removed_placeholder_id=placeholder_id)
 
@@ -251,12 +304,16 @@ def attach_parent(
 
     only_parent_id = existing_parent_ids[0]
     all_siblings = sorted(
-        {r.child_id for r in relations if r.parent_id == only_parent_id and r.child_id != person_id}
+        {
+            r.child_id
+            for r in parent_relations
+            if r.parent_id == only_parent_id and r.child_id != person_id
+        }
     )
     siblings_with_free_slot = [
         sibling_id
         for sibling_id in all_siblings
-        if len(_parent_ids(sibling_id, relations)) < MAX_PARENTS
+        if len(_parent_ids(sibling_id, parent_relations)) < MAX_PARENTS
     ]
 
     if not siblings_with_free_slot:

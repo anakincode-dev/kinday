@@ -457,15 +457,15 @@ async def test_delete_person_removes_placeholder_left_without_children() -> None
 
 
 @pytest.mark.asyncio
-async def test_delete_placeholder_with_spouse_leaves_no_dangling_edges() -> None:
+async def test_deleted_placeholder_takes_its_spouse_edge_with_it() -> None:
     """Удаление заглушки снимает и её ребро супруга, а не только рёбра к детям.
 
-    Заглушка «несёт рёбра только к детям» — инвариант её создания, но не
-    инвариант жизни узла: `add_person` не запрещает выбрать заглушку как
-    `relative_to_person_id`, поэтому супруг у неё появиться может. Если при
-    удалении такое ребро не снять, оно укажет на несуществующего человека —
-    в SQLite (PRAGMA foreign_keys=ON, SPEC 6.2) это либо отказ удаления, либо
-    каскад, а обход дерева споткнётся о призрачный узел.
+    Супруг у заглушки законен: человек с детьми сохраняет все свои рёбра,
+    превращаясь в заглушку (SPEC 4.3). Но когда заглушка лишается последнего
+    ребёнка и удаляется, это ребро обязано уйти вместе с ней — иначе оно
+    укажет на несуществующего человека: в SQLite (PRAGMA foreign_keys=ON,
+    SPEC 6.2) это либо отказ удаления, либо каскад, а обход дерева
+    споткнётся о призрачный узел.
     """
     repos = build_repos()
     family = await _create_family(
@@ -483,61 +483,54 @@ async def test_delete_placeholder_with_spouse_leaves_no_dangling_edges() -> None
         relation_kind=RelationKind.WIFE,
         relative_to_person_id=owner_person.id,
     )
-    wife_sister = await _add_person(
+    petr = await _add_person(
         repos,
         acting_account_id=owner_account.id,
         family_id=family.id,
-        name="Света",
-        gender=Gender.FEMALE,
-        birth_date=date(1993, 7, 7),
-        relation_kind=RelationKind.SISTER,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 3),
+        relation_kind=RelationKind.FATHER,
         relative_to_person_id=wife.id,
     )
-    [placeholder] = [p for p in repos.person.people.values() if p.is_placeholder]
-    await _add_person(
+    maria = await _add_person(
         repos,
         acting_account_id=owner_account.id,
         family_id=family.id,
-        name="Иван",
-        gender=Gender.MALE,
-        birth_date=date(1950, 1, 1),
-        relation_kind=RelationKind.HUSBAND,
-        relative_to_person_id=placeholder.id,
+        name="Мария",
+        gender=Gender.FEMALE,
+        birth_date=date(1962, 4, 4),
+        relation_kind=RelationKind.WIFE,
+        relative_to_person_id=petr.id,
     )
+    # Пётр становится заглушкой и сохраняет супругу Марию.
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=petr.id)
+    assert repos.person.people[petr.id].is_placeholder is True
 
-    await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife_sister.id)
+    # Ольга была его единственным ребёнком — заглушка уходит вслед за ней.
     await _delete_person(repos, acting_account_id=owner_account.id, person_id=wife.id)
 
-    assert placeholder.id not in repos.person.people
+    assert petr.id not in repos.person.people
     assert _dangling_relations(repos, family.id) == []
+    assert set(repos.person.people) == {owner_person.id, maria.id}
 
 
 @pytest.mark.asyncio
 async def test_delete_person_cascades_through_stacked_placeholders() -> None:
     """Заглушка над заглушкой тоже удаляется, когда лишилась последнего ребёнка.
 
-    Удаление человека с детьми превращает его в заглушку (SPEC 4.3), а его
-    брат, добавленный после этого, заводит над ним вторую заглушку. Когда
-    у нижней заглушки не остаётся детей, она удаляется — и тем самым может
-    лишить детей верхнюю, поэтому проверка идёт вверх по цепочке, а не на
-    один шаг.
+    Цепочка собирается сценарно: человек с детьми превращается в заглушку и
+    сохраняет ребро к своему родителю (SPEC 4.3), а тот сам уже заглушка.
+    Удаление идёт вверх по цепочке, потому что снятое ребро могло быть
+    последним ребёнком заглушки этажом выше, и остановка на одном шаге
+    оставила бы висячие рёбра.
     """
     repos = build_repos()
     family = await _create_family(
-        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+        repos, telegram_user_id=111, name="Мария", birth_date=date(1990, 6, 15)
     )
     [owner_person] = repos.person.people.values()
     [owner_account] = repos.account.accounts.values()
-    son = await _add_person(
-        repos,
-        acting_account_id=owner_account.id,
-        family_id=family.id,
-        name="Сын",
-        gender=Gender.MALE,
-        birth_date=date(2010, 1, 1),
-        relation_kind=RelationKind.SON,
-        relative_to_person_id=owner_person.id,
-    )
     grandson = await _add_person(
         repos,
         acting_account_id=owner_account.id,
@@ -546,34 +539,42 @@ async def test_delete_person_cascades_through_stacked_placeholders() -> None:
         gender=Gender.MALE,
         birth_date=date(2030, 1, 1),
         relation_kind=RelationKind.SON,
-        relative_to_person_id=son.id,
+        relative_to_person_id=owner_person.id,
     )
-    # Сын становится заглушкой: у него есть ребёнок.
-    await _delete_person(repos, acting_account_id=owner_account.id, person_id=son.id)
-    assert repos.person.people[son.id].is_placeholder is True
-    # Брат сына цепляется к заглушке-сыну, заводя над ней вторую заглушку.
-    brother = await _add_person(
+    son = await _add_person(
         repos,
         acting_account_id=owner_account.id,
         family_id=family.id,
-        name="Брат",
+        name="Борис",
         gender=Gender.MALE,
-        birth_date=date(2012, 1, 1),
-        relation_kind=RelationKind.BROTHER,
+        birth_date=date(2010, 1, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=grandson.id,
+    )
+    petr = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1980, 1, 1),
+        relation_kind=RelationKind.FATHER,
         relative_to_person_id=son.id,
     )
-    upper = [p for p in repos.person.people.values() if p.is_placeholder and p.id not in (son.id,)]
-    assert len(upper) == 1
-    [upper_placeholder] = upper
+    # Два этажа заглушек: у Петра есть ребёнок Борис, у Бориса — внук, а ребро
+    # Бориса к Петру при превращении в заглушку сохраняется.
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=petr.id)
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=son.id)
+    assert repos.person.people[petr.id].is_placeholder is True
+    assert repos.person.people[son.id].is_placeholder is True
 
+    # Один вызов обязан снять оба этажа: внук был последним ребёнком
+    # заглушки-Бориса, а та — единственным ребёнком заглушки-Петра. Других
+    # детей у Петра нет, поэтому дойти до него можно только обходом вверх.
     await _delete_person(repos, acting_account_id=owner_account.id, person_id=grandson.id)
-    # Заглушка-сын осталась без детей и должна исчезнуть, не оставив рёбер.
+
     assert son.id not in repos.person.people
-    assert _dangling_relations(repos, family.id) == []
-
-    await _delete_person(repos, acting_account_id=owner_account.id, person_id=brother.id)
-
-    assert upper_placeholder.id not in repos.person.people
+    assert petr.id not in repos.person.people
     assert _dangling_relations(repos, family.id) == []
     assert set(repos.person.people) == {owner_person.id}
 
