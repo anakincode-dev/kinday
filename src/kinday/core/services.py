@@ -9,6 +9,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import replace
 from datetime import date, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kinday.core.models import (
     BIRTHDAY_EVENT_TITLE,
@@ -43,6 +44,11 @@ from kinday.core.reminders import MISFIRE_GRACE, materialize_for_event
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
 
+# Предупредить можно не раньше чем за год: при большем смещении напоминание о
+# ежегодном событии пришло бы раньше, чем напоминание о предыдущей его
+# годовщине, то есть порядок предупреждений перевернулся бы.
+MAX_OFFSET_DAYS = 365
+
 # SPEC 5.7: код едет параметром start в t.me-ссылке, поэтому ограничен алфавитом
 # [A-Za-z0-9_-] и 64 символами. token_urlsafe(16) даёт ровно этот алфавит и 22
 # символа — 128 бит энтропии.
@@ -68,6 +74,41 @@ def _new_placeholder(family_id: int) -> Person:
     return Person(
         id=0, family_id=family_id, name=None, gender=None, birth_date=None, is_placeholder=True
     )
+
+
+def _require_known_timezone(timezone: str) -> None:
+    """Пояс должен существовать в базе zoneinfo (SPEC 5.3: строка IANA).
+
+    Ровно этот вызов делает расчёт момента отправки (core/reminders.py), так
+    что пояс, которого нет в базе, положил бы материализацию — в том числе
+    суточную, то есть уже для всех семей, а не только для этого аккаунта.
+    """
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as error:
+        raise ValueError(f"Неизвестный часовой пояс: {timezone!r}") from error
+
+
+def _require_valid_offsets(offsets_days: tuple[int, ...]) -> None:
+    """Смещения: непустой набор целых 0..MAX_OFFSET_DAYS без повторов.
+
+    Пустой набор оставил бы аккаунт вообще без напоминаний, а отписки от
+    событий в SPEC 3.4 нет: настраиваются только смещения, время суток и пояс.
+    Повтор бессмыслен — две одинаковые строки схлопнул бы уникальный индекс
+    reminders (SPEC 5.3), то есть набор молча оказался бы другим.
+    Отрицательное смещение означало бы напоминание после события.
+    """
+    if not offsets_days:
+        raise ValueError("Набор смещений не может быть пустым")
+    for offset in offsets_days:
+        # bool — подкласс int, но True вместо 1 в настройках означает ошибку
+        # вызывающего слоя, а не смещение «за один день».
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError(f"Смещение должно быть целым числом дней: {offset!r}")
+        if not 0 <= offset <= MAX_OFFSET_DAYS:
+            raise ValueError(f"Смещение вне диапазона 0..{MAX_OFFSET_DAYS}: {offset}")
+    if len(set(offsets_days)) != len(offsets_days):
+        raise ValueError(f"Смещения не могут повторяться: {offsets_days}")
 
 
 async def _require_owner(family_repo: FamilyRepo, family_id: int, acting_account_id: int) -> Family:
@@ -142,7 +183,12 @@ async def create_family(
     2.1), она переиспользуется как есть: настройки напоминаний принадлежат
     аккаунту целиком и не зависят от того, в скольких семьях он состоит,
     поэтому `owner_timezone` учитывается только при первом создании аккаунта.
+    Проверяется он всё равно всегда (SPEC 3.4): неизвестный пояс — ошибка
+    вызывающего слоя, и молчать о ней, потому что значение не понадобилось,
+    значит откладывать отказ до случая, когда оно понадобится.
     """
+    _require_known_timezone(owner_timezone)
+
     account = await account_repo.get_by_telegram_user_id(owner_telegram_user_id)
     if account is None:
         account = await account_repo.save(
@@ -378,9 +424,18 @@ async def update_person(
     событие kind=BIRTHDAY — оно заводится один раз при создании (см.
     _materialize_birthday) и больше не дублируется. Отклоняет действие, если
     acting_account не владелец семьи (family_repo).
+
+    Отклоняет и заглушку: у неё нет ни имени, ни пола, ни даты рождения по
+    определению (SPEC 4.1), и нет события дня рождения, которое перестраивают
+    ниже. Правка превратила бы её в обычного человека в обход слияния с
+    настоящим родителем («первый настоящий родитель сливается с заглушкой»),
+    и свободный слот второго родителя её дети потеряли бы вместе с ней.
+    Настоящий человек заводится на её месте через add_person.
     """
     person = await person_repo.get(person_id)
     await _require_owner(family_repo, person.family_id, acting_account_id)
+    if person.is_placeholder:
+        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, не редактируется")
 
     birth_date_changed = person.birth_date != birth_date
     person.name = name
@@ -407,12 +462,15 @@ async def update_person(
 async def delete_person(
     acting_account_id: int,
     person_id: int,
+    account_repo: AccountRepo,
     event_repo: EventRepo,
     family_repo: FamilyRepo,
     person_repo: PersonRepo,
     relation_repo: RelationRepo,
     membership_repo: MembershipRepo,
+    invite_repo: InviteRepo,
     reminder_repo: ReminderRepo,
+    clock: Clock,
 ) -> None:
     """Удаляет человека физически, либо, если у него есть дети, превращает
 
@@ -426,6 +484,19 @@ async def delete_person(
     осталось ни одного ребёнка, удаляется вместе с ним
     (_drop_childless_placeholders).
 
+    Вместе с записью отзываются все выданные на неё неиспользованные
+    приглашения (SPEC 3.2: приглашение привязано к конкретной записи): иначе
+    код продолжал бы работать, а привязывать по нему было бы нечего — записи
+    либо нет вовсе, либо она стала заглушкой, которой issue_invite приглашение
+    и не выдаёт. Уже использованные приглашения не трогаются: они хранят
+    историю, отзывать в них нечего.
+
+    Если у удалённого человека был привязан аккаунт и его current_family_id
+    указывал на эту семью, текущая семья переводится на любую другую семью
+    аккаунта, а если других нет — на None. Текущая семья определяет, к какой
+    семье относятся команды бота (SPEC 2.1), и указывать на семью, в которой
+    аккаунт больше не состоит, она не может.
+
     Отклоняет действие, если acting_account не владелец семьи (family_repo), и
     если владелец удаляет собственную запись: передача владения семьёй вне
     скоупа первой версии (SPEC 7), поэтому families.owner_account_id указывал
@@ -438,11 +509,22 @@ async def delete_person(
     if own is not None and own.person_id == person_id:
         raise ValueError(f"Аккаунт {acting_account_id} не может удалить собственную запись")
 
+    now = clock.now()
+    for invite in await invite_repo.list_by_person(person_id):
+        if invite.used_at is None and invite.revoked_at is None:
+            await invite_repo.revoke(invite.id, now)
+
     for event in await event_repo.list_by_person(person_id):
         await reminder_repo.delete_all_for_event(event.id)
         await event_repo.delete(event.id)
     await reminder_repo.delete_all_for_person(person_id)
+
+    freed = await membership_repo.get_by_person(person_id)
     await membership_repo.delete(person_id)
+    if freed is not None:
+        await _drop_current_family(
+            freed.account_id, person.family_id, account_repo, membership_repo
+        )
 
     relations = await relation_repo.list_by_family(person.family_id)
     has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
@@ -465,6 +547,29 @@ async def delete_person(
         await person_repo.delete(person_id)
 
     await _drop_childless_placeholders(parent_ids, person.family_id, person_repo, relation_repo)
+
+
+async def _drop_current_family(
+    account_id: int,
+    left_family_id: int,
+    account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
+) -> None:
+    """Уводит current_family_id аккаунта с семьи, в которой он больше не состоит.
+
+    Вызывается после удаления Membership, поэтому list_by_account уже не
+    содержит покинутую семью: подходит любая из оставшихся (SPEC 2.1 — выбор
+    текущей семьи всё равно за пользователем, здесь важно лишь не оставить
+    ссылку на чужую). Если других семей нет, остаётся None — как у только что
+    созданного аккаунта.
+    """
+    account = await account_repo.get(account_id)
+    if account.current_family_id != left_family_id:
+        return
+
+    remaining = await membership_repo.list_by_account(account_id)
+    account.current_family_id = remaining[0].family_id if remaining else None
+    await account_repo.save(account)
 
 
 async def _drop_childless_placeholders(
@@ -612,9 +717,22 @@ async def accept_invite(
     существующих событиях своей семьи (SPEC 5.6: «добавлен человек... привязан
     аккаунт» — повод для материализации), кроме собственного дня рождения, с
     учётом уже выставленных на эти события переопределений (SPEC 5.3, 5.6):
-    владелец мог настроить ReminderOverride для этого аккаунта на событие ещё
-    до того, как приглашение было принято.
+    аккаунт мог состоять в этой семье раньше и оставить ReminderOverride —
+    удаление записи снимает привязку, но переопределения не трогает (SPEC 3.4),
+    поэтому при возврате они снова вступают в силу.
+
+    Отклоняет и приглашение на запись, которой уже нет или которая стала
+    заглушкой. Удаление человека отзывает его приглашения само (delete_person),
+    так что это вторая линия защиты, независимая от первой: привязывать аккаунт
+    к заглушке нельзя — у неё нет ни имени, чтобы показать «Антон приглашает
+    вас как Марину» (SPEC 3.2), ни даты рождения, ни события дня рождения.
+    Проверка идёт до создания аккаунта, поэтому при отказе в хранилище не
+    остаётся следов вызова. По той же причине первым проверяется `timezone`
+    (SPEC 3.4): иначе неизвестный пояс уронил бы материализацию уже после
+    mark_used, то есть одноразовый код сгорел бы ни за что.
     """
+    _require_known_timezone(timezone)
+
     invite = await invite_repo.get_by_code(code)
     if invite is None:
         raise ValueError("Приглашение не найдено")
@@ -628,6 +746,18 @@ async def accept_invite(
         raise ValueError("Приглашение просрочено")
     if await membership_repo.get_by_person(invite.person_id) is not None:
         raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+
+    # Запись ищется среди людей семьи, а не через PersonRepo.get: тот обязан
+    # вернуть Person и на отсутствующий id ответит ошибкой хранилища, а здесь
+    # нужен обычный отказ сценария.
+    person = next(
+        (p for p in await person_repo.list_by_family(invite.family_id) if p.id == invite.person_id),
+        None,
+    )
+    if person is None:
+        raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
+    if person.is_placeholder:
+        raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
 
     account = await account_repo.get_by_telegram_user_id(telegram_user_id)
     if account is None:
@@ -665,7 +795,7 @@ async def accept_invite(
     if reminders:
         await reminder_repo.add_many(reminders)
 
-    return await person_repo.get(invite.person_id)
+    return person
 
 
 async def add_event(
@@ -688,12 +818,17 @@ async def add_event(
     `is_recurring_yearly` различает ежегодное событие (например, годовщина
     свадьбы) и разовое (SPEC 3.3, 4). Отклоняет действие, если acting_account
     не владелец семьи (family_repo), и если person_id не принадлежит family_id.
+
+    Отклоняет и заглушку: она не порождает событий (SPEC 4.1) — имени у неё
+    нет, так что текст напоминания ушёл бы всей семье с пустым получателем.
     """
     await _require_owner(family_repo, family_id, acting_account_id)
 
     person = await person_repo.get(person_id)
     if person.family_id != family_id:
         raise ValueError(f"Человек {person_id} не принадлежит семье {family_id}")
+    if person.is_placeholder:
+        raise ValueError(f"Запись {person_id} — заглушка неизвестного родителя, событий не имеет")
 
     event = await event_repo.create(
         Event(
@@ -733,7 +868,15 @@ async def update_account_settings(
     Переопределения на отдельные события (ReminderOverrideRepo) сохраняют силу
     — их учитывает _rematerialize_event_for_person. Уже отправленные
     напоминания не трогает: пересчитываются только будущие pending-строки.
+
+    Ввод проверяется целиком до первой записи (_require_known_timezone,
+    _require_valid_offsets): иначе аккаунт остался бы с новыми настройками,
+    а перематериализация упала бы на середине, оставив часть семей с
+    напоминаниями по старым настройкам и часть — вообще без будущих строк.
     """
+    _require_known_timezone(timezone)
+    _require_valid_offsets(offsets_days)
+
     account = await account_repo.get(account_id)
     account.timezone = timezone
     account.offsets_days = offsets_days
@@ -764,10 +907,30 @@ async def set_override(
     """Переопределяет смещения и время суток для пары (аккаунт, событие) и
 
     перестраивает будущие напоминания по этому событию для этого аккаунта
-    (SPEC 5.6). Если аккаунт не состоит в семье этого события, переопределение
-    всё равно сохраняется (пригодится, если он позже присоединится), но
-    пересчитывать пока нечего.
+    (SPEC 5.6).
+
+    Отклоняет аккаунт без Membership в семье события: переопределение есть
+    только у участника (SPEC 2 — участник меняет свои смещения и своё время
+    суток; SPEC 3.4 — переопределяется набор для события, о котором он получает
+    напоминания). Посторонний аккаунт напоминаний по этой семье не получает,
+    так что переопределять ему нечего.
+
+    Обратное неверно: уже сохранённое переопределение переживает выход из
+    семьи — delete_person снимает привязку аккаунта, а reminder_overrides не
+    трогает. Если тот же аккаунт вернётся в семью, accept_invite прочитает
+    переопределение при первой же материализации.
+
+    Ввод проверяется до записи (_require_valid_offsets), как в
+    update_account_settings: смещения переопределения попадают в те же
+    reminders.
     """
+    _require_valid_offsets(offsets_days)
+
+    event = await event_repo.get(event_id)
+    membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
+    if membership is None:
+        raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
+
     override = ReminderOverride(
         account_id=account_id,
         event_id=event_id,
@@ -776,13 +939,10 @@ async def set_override(
     )
     await override_repo.set(override)
 
-    event = await event_repo.get(event_id)
-    membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
-    if membership is not None:
-        account = await account_repo.get(account_id)
-        await _rematerialize_event_for_person(
-            event, membership, account, override_repo, reminder_repo, clock
-        )
+    account = await account_repo.get(account_id)
+    await _rematerialize_event_for_person(
+        event, membership, account, override_repo, reminder_repo, clock
+    )
 
     return override
 

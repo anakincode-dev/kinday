@@ -183,6 +183,29 @@ async def test_create_family_reuses_existing_account_for_second_family() -> None
 
 
 @pytest.mark.asyncio
+async def test_create_family_rejects_unknown_timezone_and_writes_nothing() -> None:
+    """Пояс проверяется до первой записи (SPEC 3.4), а не при первой материализации.
+
+    Свой день рождения владелец не получает (SPEC 3.4), поэтому без проверки
+    пояс, которого нет в базе zoneinfo, доехал бы до accounts незамеченным, а
+    упало бы уже следующее действие — посреди работы, оставив человека и
+    событие без напоминаний (SPEC 5.6).
+    """
+    repos = build_repos()
+
+    with pytest.raises(ValueError):
+        await _create_family(
+            repos,
+            telegram_user_id=111,
+            name="Антон",
+            birth_date=date(1990, 6, 15),
+            timezone="Нет/Такого",
+        )
+
+    assert _snapshot(repos) == _snapshot(build_repos())
+
+
+@pytest.mark.asyncio
 async def test_add_person_materializes_reminder_immediately() -> None:
     """Критерий приёмки 14: добавление человека сразу создаёт напоминания о его дне рождения."""
     repos = build_repos()
@@ -728,6 +751,44 @@ async def test_add_event_rejects_person_from_another_family() -> None:
     with pytest.raises(ValueError):
         await _add_event(
             repos, acting_account_id=owner1_account.id, family_id=family1.id, person_id=boris.id
+        )
+
+    assert _snapshot(repos) == before
+
+
+@pytest.mark.asyncio
+async def test_add_event_rejects_placeholder_and_writes_nothing() -> None:
+    """Заглушка не порождает событий (SPEC 4.1).
+
+    У неё нет имени, поэтому текст напоминания вышел бы с пустым получателем
+    («Годовщина — None»), а разослан он был бы всем участникам семьи.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=owner_person.id,
+    )
+    [placeholder] = [p for p in repos.person.people.values() if p.is_placeholder]
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _add_event(
+            repos,
+            acting_account_id=owner_account.id,
+            family_id=family.id,
+            person_id=placeholder.id,
+            title="Годовщина",
         )
 
     assert _snapshot(repos) == before

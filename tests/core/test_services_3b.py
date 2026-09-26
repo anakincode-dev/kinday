@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
+from typing import cast
 
 import pytest
 from tests.core.fakes import FixedClock, Repos, build_repos
@@ -20,6 +21,7 @@ from tests.core.fakes import FixedClock, Repos, build_repos
 from kinday.core.models import (
     Account,
     Gender,
+    Invite,
     Membership,
     ParentOf,
     Person,
@@ -98,12 +100,85 @@ async def _delete_person(repos: Repos, *, acting_account_id: int, person_id: int
     await delete_person(
         acting_account_id,
         person_id,
+        repos.account,
         repos.event,
         repos.family,
         repos.person,
         repos.relation,
         repos.membership,
+        repos.invite,
         repos.reminder,
+        CLOCK,
+    )
+
+
+async def _update_person(
+    repos: Repos,
+    *,
+    acting_account_id: int,
+    person_id: int,
+    name: str,
+    gender: Gender,
+    birth_date: date,
+):
+    return await update_person(
+        acting_account_id,
+        person_id,
+        name,
+        gender,
+        birth_date,
+        repos.account,
+        repos.event,
+        repos.family,
+        repos.person,
+        repos.membership,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+    )
+
+
+async def _update_account_settings(
+    repos: Repos,
+    *,
+    account_id: int,
+    timezone: str,
+    offsets_days: tuple[int, ...],
+    time_of_day: time,
+):
+    return await update_account_settings(
+        account_id,
+        timezone,
+        offsets_days,
+        time_of_day,
+        repos.account,
+        repos.membership,
+        repos.event,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+    )
+
+
+async def _set_override(
+    repos: Repos,
+    *,
+    account_id: int,
+    event_id: int,
+    offsets_days: tuple[int, ...],
+    time_of_day: time,
+):
+    return await set_override(
+        account_id,
+        event_id,
+        offsets_days,
+        time_of_day,
+        repos.override,
+        repos.event,
+        repos.account,
+        repos.membership,
+        repos.reminder,
+        CLOCK,
     )
 
 
@@ -152,6 +227,8 @@ def _snapshot(repos: Repos) -> dict[str, object]:
             "events": repos.event.events,
             "relations": repos.relation.relations,
             "reminders": repos.reminder.reminders,
+            "invites": repos.invite.invites,
+            "overrides": repos.override.overrides,
         }
     )
 
@@ -518,6 +595,303 @@ async def test_delete_person_rejects_non_owner_and_writes_nothing() -> None:
     assert _snapshot(repos) == before
 
 
+@pytest.mark.asyncio
+async def test_delete_person_revokes_unused_invites() -> None:
+    """Удаление записи отзывает все выданные на неё неиспользованные приглашения.
+
+    Приглашение привязано к конкретной записи (SPEC 3.2), а после удаления
+    привязывать по нему нечего: записи либо нет вовсе, либо она стала
+    заглушкой без имени, которую issue_invite и сам не приглашает. Отец здесь
+    именно превращается в заглушку — у него есть ребёнок (SPEC 4.3), то есть
+    строка people уцелела и без отзыва код продолжал бы работать.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    father = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=owner_person.id,
+    )
+    invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=father.id)
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=father.id)
+
+    assert repos.person.people[father.id].is_placeholder is True
+    assert repos.invite.invites[invite.id].revoked_at == CLOCK.now()
+    with pytest.raises(ValueError):
+        await _accept_invite(repos, code=invite.code, telegram_user_id=222)
+
+
+@pytest.mark.asyncio
+async def test_delete_person_keeps_used_invites() -> None:
+    """Использованное приглашение при удалении записи не отзывается.
+
+    Отзыв — способ погасить ещё работающий код (SPEC 3.2), а использованное
+    приглашение уже одноразово погашено полем used_at и хранится только как
+    история: выставить ему ещё и revoked_at значило бы переписать прошлое.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    sister = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=owner_person.id,
+    )
+    invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=sister.id)
+    await _accept_invite(repos, code=invite.code, telegram_user_id=222)
+    assert repos.invite.invites[invite.id].used_at == CLOCK.now()
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=sister.id)
+
+    assert repos.invite.invites[invite.id].used_at == CLOCK.now()
+    assert repos.invite.invites[invite.id].revoked_at is None
+
+
+@pytest.mark.asyncio
+async def test_delete_person_switches_current_family_of_freed_account() -> None:
+    """Удаление записи участника переводит его текущую семью на другую его семью.
+
+    current_family_id определяет, к какой семье относятся команды бота
+    (SPEC 2.1). После удаления записи аккаунт в этой семье больше не состоит,
+    и ссылка указывала бы на семью, чьи данные ему уже не видны. Когда других
+    семей у аккаунта нет, остаётся None — как у только что созданного аккаунта.
+    """
+    repos = build_repos()
+    family1 = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [anton_person] = repos.person.people.values()
+    [anton_account] = repos.account.accounts.values()
+    marina_in_family1 = await _add_person(
+        repos,
+        acting_account_id=anton_account.id,
+        family_id=family1.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=anton_person.id,
+    )
+    invite1 = await _issue_invite(
+        repos, acting_account_id=anton_account.id, person_id=marina_in_family1.id
+    )
+    await _accept_invite(repos, code=invite1.code, telegram_user_id=222)
+    [marina_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 222]
+    assert marina_account.current_family_id == family1.id
+
+    # Вторая семья Марины: текущей она не становится (SPEC 2.1 — текущая
+    # семья меняется только явной командой либо когда её ещё нет).
+    family2 = await _create_family(
+        repos, telegram_user_id=333, name="Борис", birth_date=date(1985, 8, 20)
+    )
+    [boris_person] = [p for p in repos.person.people.values() if p.family_id == family2.id]
+    [boris_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 333]
+    marina_in_family2 = await _add_person(
+        repos,
+        acting_account_id=boris_account.id,
+        family_id=family2.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=boris_person.id,
+    )
+    invite2 = await _issue_invite(
+        repos, acting_account_id=boris_account.id, person_id=marina_in_family2.id
+    )
+    await _accept_invite(repos, code=invite2.code, telegram_user_id=222)
+    assert marina_account.current_family_id == family1.id
+
+    await _delete_person(repos, acting_account_id=anton_account.id, person_id=marina_in_family1.id)
+
+    assert marina_account.current_family_id == family2.id
+
+    await _delete_person(repos, acting_account_id=boris_account.id, person_id=marina_in_family2.id)
+
+    assert marina_account.current_family_id is None
+
+
+@pytest.mark.asyncio
+async def test_delete_person_keeps_current_family_of_untouched_account() -> None:
+    """Текущая семья не сбрасывается, если удалена запись другого человека.
+
+    Удаляется запись без привязанного аккаунта, поэтому чужие current_family_id
+    трогать не за что.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    sister = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=owner_person.id,
+    )
+
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=sister.id)
+
+    assert owner_account.current_family_id == family.id
+
+
+@pytest.mark.asyncio
+async def test_delete_person_keeps_current_family_pointing_to_another_family() -> None:
+    """Аккаунт освободился, но его текущая семья — другая: трогать её не за что.
+
+    Текущую семью выбирает пользователь (SPEC 2.1), и сценарий уводит её
+    только с той семьи, в которой аккаунт перестал состоять.
+    """
+    repos = build_repos()
+    family1 = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [anton_person] = repos.person.people.values()
+    [anton_account] = repos.account.accounts.values()
+    marina_in_family1 = await _add_person(
+        repos,
+        acting_account_id=anton_account.id,
+        family_id=family1.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=anton_person.id,
+    )
+    invite1 = await _issue_invite(
+        repos, acting_account_id=anton_account.id, person_id=marina_in_family1.id
+    )
+    await _accept_invite(repos, code=invite1.code, telegram_user_id=222)
+    [marina_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 222]
+
+    family2 = await _create_family(
+        repos, telegram_user_id=333, name="Борис", birth_date=date(1985, 8, 20)
+    )
+    [boris_person] = [p for p in repos.person.people.values() if p.family_id == family2.id]
+    [boris_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 333]
+    marina_in_family2 = await _add_person(
+        repos,
+        acting_account_id=boris_account.id,
+        family_id=family2.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=boris_person.id,
+    )
+    invite2 = await _issue_invite(
+        repos, acting_account_id=boris_account.id, person_id=marina_in_family2.id
+    )
+    await _accept_invite(repos, code=invite2.code, telegram_user_id=222)
+    assert marina_account.current_family_id == family1.id
+
+    # Удаляется запись во второй семье, а текущая указывает на первую.
+    await _delete_person(repos, acting_account_id=boris_account.id, person_id=marina_in_family2.id)
+
+    assert marina_account.current_family_id == family1.id
+
+
+@pytest.mark.asyncio
+async def test_accept_invite_rejects_unknown_timezone_and_writes_nothing() -> None:
+    """Пояс проверяется до всего остального, иначе приглашение сгорело бы зря.
+
+    Без проверки падение приходилось бы на материализацию — после mark_used,
+    создания аккаунта и Membership: одноразовый код погашен, а аккаунт остался
+    с поясом, на котором ложится и суточная материализация всех семей
+    (SPEC 5.4).
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    sister = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=date(1992, 4, 4),
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=owner_person.id,
+    )
+    invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=sister.id)
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _accept_invite(repos, code=invite.code, telegram_user_id=222, timezone="Нет/Такого")
+
+    assert _snapshot(repos) == before
+    # Код остался годным: его можно принять с настоящим поясом.
+    await _accept_invite(repos, code=invite.code, telegram_user_id=222)
+
+
+@pytest.mark.asyncio
+async def test_update_person_rejects_placeholder_and_writes_nothing() -> None:
+    """Заглушка не редактируется: по определению у неё нет имени, пола и даты.
+
+    Правка превратила бы её в обычного человека в обход слияния с настоящим
+    родителем (SPEC 4.1: первый настоящий родитель сливается с заглушкой), и
+    свободный слот родителя у её детей исчез бы вместе с ней.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    father = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=owner_person.id,
+    )
+    # Удаление человека с ребёнком превращает его в заглушку (SPEC 4.3).
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=father.id)
+    assert repos.person.people[father.id].is_placeholder is True
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _update_person(
+            repos,
+            acting_account_id=owner_account.id,
+            person_id=father.id,
+            name="Пётр",
+            gender=Gender.MALE,
+            birth_date=date(1960, 3, 1),
+        )
+
+    assert _snapshot(repos) == before
+
+
 # --- Критерии 24-26: приглашения --------------------------------------------
 
 
@@ -686,6 +1060,53 @@ async def test_accept_invite_rejects_expired_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_accept_invite_rejects_placeholder_or_missing_person() -> None:
+    """Вторая линия защиты: код на заглушку или на исчезнувшую запись не принимается.
+
+    delete_person отзывает такие приглашения сам
+    (test_delete_person_revokes_unused_invites), но accept_invite на это не
+    полагается: приглашение могло уцелеть, а привязывать аккаунт к заглушке
+    или к несуществующей записи нельзя — получатель приглашения известен
+    заранее и показывается по имени, «Антон приглашает вас как Марину»
+    (SPEC 3.2), которого у заглушки нет.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    placeholder = await repos.person.create(
+        Person(
+            id=0,
+            family_id=family.id,
+            name=None,
+            gender=None,
+            birth_date=None,
+            is_placeholder=True,
+        )
+    )
+    now = CLOCK.now()
+    for code, person_id in (("placeholder-code", placeholder.id), ("missing-code", 999)):
+        await repos.invite.create(
+            Invite(
+                id=0,
+                family_id=family.id,
+                person_id=person_id,
+                code=code,
+                created_at=now,
+                expires_at=now + timedelta(days=7),
+            )
+        )
+    before = _snapshot(repos)
+
+    for code in ("placeholder-code", "missing-code"):
+        with pytest.raises(ValueError):
+            await _accept_invite(repos, code=code, telegram_user_id=222)
+
+    # Ни аккаунта, ни привязки, ни напоминаний: отказ до первой записи.
+    assert _snapshot(repos) == before
+
+
+@pytest.mark.asyncio
 async def test_revoke_invite_rejects_non_owner() -> None:
     repos = build_repos()
     family = await _create_family(
@@ -755,13 +1176,16 @@ async def test_accept_invite_materializes_reminders_for_existing_events() -> Non
 
 
 @pytest.mark.asyncio
-async def test_accept_invite_respects_override_set_before_joining() -> None:
-    """SPEC 5.6: переопределение, выставленное до присоединения, не теряется.
+async def test_accept_invite_respects_override_left_from_previous_membership() -> None:
+    """SPEC 5.6: переопределение, уцелевшее от прежнего участия, применяется сразу.
 
-    set_override сохраняет ReminderOverride даже когда аккаунт ещё не состоит
-    в семье события (docstring set_override). accept_invite обязан прочитать
-    его при первой же материализации, а не только последующие
-    перематериализации через _rematerialize_event_for_person.
+    Выставить переопределение может только участник семьи события
+    (test_set_override_rejects_account_without_membership), но пережить выход
+    из семьи оно может: delete_person снимает привязку аккаунта, а строку в
+    reminder_overrides не трогает. Если тот же аккаунт вернётся в семью по
+    приглашению на другую запись, accept_invite обязан прочитать
+    переопределение при первой же материализации, а не только при последующих
+    перематериализациях через _rematerialize_event_for_person.
     """
     repos = build_repos()
     family = await _create_family(
@@ -779,45 +1203,49 @@ async def test_accept_invite_respects_override_set_before_joining() -> None:
         relation_kind=RelationKind.SISTER,
         relative_to_person_id=owner_person.id,
     )
-    invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=sister.id)
+    brother = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Дима",
+        gender=Gender.MALE,
+        birth_date=date(1993, 5, 5),
+        relation_kind=RelationKind.BROTHER,
+        relative_to_person_id=owner_person.id,
+    )
     # Событие самой Марины сюда не годится: о своём дне рождения она
     # напоминания не получает (самоисключение, SPEC 3.4).
     [owner_event] = [e for e in repos.event.events.values() if e.person_id == owner_person.id]
 
-    # Пока Марина ещё не приняла приглашение, у неё уже есть аккаунт
-    # (например, он раньше состоял в другой семье) — владелец выставляет
-    # переопределение по её будущему account_id.
-    future_member_account = await repos.account.save(
-        Account(
-            id=0,
-            telegram_user_id=222,
-            current_family_id=None,
-            timezone="Europe/Moscow",
-            offsets_days=DEFAULT_OFFSETS_DAYS,
-            time_of_day=time(9, 0),
-        )
+    sister_invite = await _issue_invite(
+        repos, acting_account_id=owner_account.id, person_id=sister.id
     )
-    await set_override(
-        future_member_account.id,
-        owner_event.id,
-        (2,),
-        time(8, 0),
-        repos.override,
-        repos.event,
-        repos.account,
-        repos.membership,
-        repos.reminder,
-        CLOCK,
+    await _accept_invite(repos, code=sister_invite.code, telegram_user_id=222)
+    [member_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 222]
+    await _set_override(
+        repos,
+        account_id=member_account.id,
+        event_id=owner_event.id,
+        offsets_days=(2,),
+        time_of_day=time(8, 0),
     )
 
-    await _accept_invite(repos, code=invite.code, telegram_user_id=222)
+    # Запись Марины удалена вместе с привязкой аккаунта, переопределение
+    # осталось. Тот же аккаунт возвращается в семью уже как Дима.
+    await _delete_person(repos, acting_account_id=owner_account.id, person_id=sister.id)
+    assert await repos.override.get(member_account.id, owner_event.id) is not None
+    brother_invite = await _issue_invite(
+        repos, acting_account_id=owner_account.id, person_id=brother.id
+    )
 
-    sister_reminders = [
+    await _accept_invite(repos, code=brother_invite.code, telegram_user_id=222)
+
+    brother_reminders = [
         r
         for r in repos.reminder.reminders
-        if r.person_id == sister.id and r.event_id == owner_event.id
+        if r.person_id == brother.id and r.event_id == owner_event.id
     ]
-    assert {r.offset_days for r in sister_reminders} == {2}
+    assert {r.offset_days for r in brother_reminders} == {2}
 
 
 @pytest.mark.asyncio
@@ -903,17 +1331,12 @@ async def test_non_owner_member_can_update_own_account_settings() -> None:
             relative_to_person_id=owner_person.id,
         )
 
-    updated = await update_account_settings(
-        member_account.id,
-        "Asia/Tokyo",
-        (3, 0),
-        time(10, 0),
-        repos.account,
-        repos.membership,
-        repos.event,
-        repos.override,
-        repos.reminder,
-        CLOCK,
+    updated = await _update_account_settings(
+        repos,
+        account_id=member_account.id,
+        timezone="Asia/Tokyo",
+        offsets_days=(3, 0),
+        time_of_day=time(10, 0),
     )
     assert updated.timezone == "Asia/Tokyo"
     assert updated.offsets_days == (3, 0)
@@ -936,20 +1359,13 @@ async def test_update_person_rejects_non_owner() -> None:
     )
 
     with pytest.raises(NotFamilyOwner):
-        await update_person(
-            intruder_account.id,
-            owner_person.id,
-            "Новое имя",
-            Gender.MALE,
-            date(1990, 6, 15),
-            repos.account,
-            repos.event,
-            repos.family,
-            repos.person,
-            repos.membership,
-            repos.override,
-            repos.reminder,
-            CLOCK,
+        await _update_person(
+            repos,
+            acting_account_id=intruder_account.id,
+            person_id=owner_person.id,
+            name="Новое имя",
+            gender=Gender.MALE,
+            birth_date=date(1990, 6, 15),
         )
 
 
@@ -977,20 +1393,13 @@ async def test_update_person_birth_date_change_rebuilds_birthday_reminders() -> 
     )
     [father_event] = [e for e in repos.event.events.values() if e.person_id == father.id]
 
-    updated = await update_person(
-        owner_account.id,
-        father.id,
-        "Пётр",
-        Gender.MALE,
-        date(1960, 4, 10),
-        repos.account,
-        repos.event,
-        repos.family,
-        repos.person,
-        repos.membership,
-        repos.override,
-        repos.reminder,
-        CLOCK,
+    updated = await _update_person(
+        repos,
+        acting_account_id=owner_account.id,
+        person_id=father.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 4, 10),
     )
 
     assert updated.birth_date == date(1960, 4, 10)
@@ -1044,17 +1453,12 @@ async def test_set_override_replaces_offsets_for_single_account() -> None:
     )
     [father_event] = [e for e in repos.event.events.values() if e.person_id == father.id]
 
-    await set_override(
-        owner_account.id,
-        father_event.id,
-        (2,),
-        time(8, 0),
-        repos.override,
-        repos.event,
-        repos.account,
-        repos.membership,
-        repos.reminder,
-        CLOCK,
+    await _set_override(
+        repos,
+        account_id=owner_account.id,
+        event_id=father_event.id,
+        offsets_days=(2,),
+        time_of_day=time(8, 0),
     )
 
     owner_reminders = [
@@ -1127,17 +1531,12 @@ async def test_timezone_change_rebuilds_in_every_family_of_account() -> None:
     }
     assert before == {father_event.id, boris_event.id}
 
-    await update_account_settings(
-        anton_account.id,
-        "Asia/Tokyo",
-        DEFAULT_OFFSETS_DAYS,
-        time(9, 0),
-        repos.account,
-        repos.membership,
-        repos.event,
-        repos.override,
-        repos.reminder,
-        CLOCK,
+    await _update_account_settings(
+        repos,
+        account_id=anton_account.id,
+        timezone="Asia/Tokyo",
+        offsets_days=DEFAULT_OFFSETS_DAYS,
+        time_of_day=time(9, 0),
     )
 
     anton_reminders = [r for r in repos.reminder.reminders if r.person_id in anton_ids]
@@ -1184,17 +1583,12 @@ async def test_timezone_change_keeps_sent_and_rebuilds_pending() -> None:
     sent.status = ReminderStatus.SENT
     sent.sent_at = datetime(2027, 2, 22, 6, 0, 30, tzinfo=UTC)
 
-    await update_account_settings(
-        owner_account.id,
-        "Asia/Tokyo",
-        DEFAULT_OFFSETS_DAYS,
-        time(9, 0),
-        repos.account,
-        repos.membership,
-        repos.event,
-        repos.override,
-        repos.reminder,
-        CLOCK,
+    await _update_account_settings(
+        repos,
+        account_id=owner_account.id,
+        timezone="Asia/Tokyo",
+        offsets_days=DEFAULT_OFFSETS_DAYS,
+        time_of_day=time(9, 0),
     )
 
     by_offset = {r.offset_days: r for r in repos.reminder.reminders}
@@ -1253,17 +1647,12 @@ async def test_settings_change_rebuilds_reminder_inside_misfire_grace() -> None:
     assert before.due_at_utc == datetime(2026, 12, 31, 6, 0, tzinfo=UTC)
     assert before.due_at_utc < CLOCK.now()
 
-    await update_account_settings(
-        owner_account.id,
-        "Europe/Moscow",
-        DEFAULT_OFFSETS_DAYS,
-        time(10, 0),
-        repos.account,
-        repos.membership,
-        repos.event,
-        repos.override,
-        repos.reminder,
-        CLOCK,
+    await _update_account_settings(
+        repos,
+        account_id=owner_account.id,
+        timezone="Europe/Moscow",
+        offsets_days=DEFAULT_OFFSETS_DAYS,
+        time_of_day=time(10, 0),
     )
 
     [after] = _inside_grace_reminders()
@@ -1288,3 +1677,153 @@ async def test_set_current_family_rejects_family_without_membership() -> None:
         anton_account.id, family1.id, repos.account, repos.membership
     )
     assert updated.current_family_id == family1.id
+
+
+# --- Проверка ввода настроек ------------------------------------------------
+
+# Наборы смещений, которые обязаны быть отклонены до любой записи в хранилище:
+# пустой набор (напоминаний не будет вовсе, отписки от событий в SPEC 3.4 нет),
+# повтор (в reminders пара строк схлопнулась бы в одну уникальным индексом
+# SPEC 5.3), отрицательное смещение (напоминание после события), смещение
+# дальше горизонта материализации (строка не появилась бы никогда) и нецелые
+# значения — их приносит внешний слой, где тип не гарантирован. True не
+# считается единицей: в настройках это ошибка вызова, а не смещение.
+BAD_OFFSETS: list[tuple[int, ...]] = [
+    (),
+    (7, 7),
+    (-1,),
+    (366,),
+    cast(tuple[int, ...], (1.5,)),
+    cast(tuple[int, ...], (True, 7)),
+]
+
+
+async def _family_with_member_event(repos: Repos):
+    """Семья, где у владельца есть событие отца и напоминания по нему.
+
+    Общая заготовка для проверок отказа: есть что испортить неверным вводом.
+    """
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [owner_person] = repos.person.people.values()
+    [owner_account] = repos.account.accounts.values()
+    father = await _add_person(
+        repos,
+        acting_account_id=owner_account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=owner_person.id,
+    )
+    [father_event] = [e for e in repos.event.events.values() if e.person_id == father.id]
+    return family, owner_account, father_event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offsets_days", BAD_OFFSETS)
+async def test_update_account_settings_rejects_bad_offsets_and_writes_nothing(
+    offsets_days: tuple[int, ...],
+) -> None:
+    """Неверные смещения отклоняются до записи: настройки и напоминания целы."""
+    repos = build_repos()
+    _, owner_account, _ = await _family_with_member_event(repos)
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _update_account_settings(
+            repos,
+            account_id=owner_account.id,
+            timezone="Asia/Tokyo",
+            offsets_days=offsets_days,
+            time_of_day=time(10, 0),
+        )
+
+    assert _snapshot(repos) == before
+
+
+@pytest.mark.asyncio
+async def test_update_account_settings_rejects_unknown_timezone_and_writes_nothing() -> None:
+    """Пояс — строка IANA (SPEC 5.3), неизвестной в zoneinfo быть не может.
+
+    Такой пояс не просто бессмыслен: расчёт момента отправки делает
+    ZoneInfo(account.timezone), и строка, не найденная в базе поясов, положила
+    бы материализацию — в том числе суточную, то есть уже для всех семей.
+    Проверка идёт до записи, поэтому старый пояс остаётся в силе.
+    """
+    repos = build_repos()
+    _, owner_account, _ = await _family_with_member_event(repos)
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _update_account_settings(
+            repos,
+            account_id=owner_account.id,
+            timezone="Нет/Такого",
+            offsets_days=DEFAULT_OFFSETS_DAYS,
+            time_of_day=time(10, 0),
+        )
+
+    assert _snapshot(repos) == before
+    assert repos.account.accounts[owner_account.id].timezone == "Europe/Moscow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offsets_days", BAD_OFFSETS)
+async def test_set_override_rejects_bad_offsets_and_writes_nothing(
+    offsets_days: tuple[int, ...],
+) -> None:
+    """Переопределение проверяет смещения так же, как общие настройки аккаунта."""
+    repos = build_repos()
+    _, owner_account, father_event = await _family_with_member_event(repos)
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _set_override(
+            repos,
+            account_id=owner_account.id,
+            event_id=father_event.id,
+            offsets_days=offsets_days,
+            time_of_day=time(8, 0),
+        )
+
+    assert _snapshot(repos) == before
+    assert await repos.override.get(owner_account.id, father_event.id) is None
+
+
+@pytest.mark.asyncio
+async def test_set_override_rejects_account_without_membership() -> None:
+    """Переопределение по событию есть только у участника его семьи (SPEC 2, 3.4).
+
+    Аккаунт без Membership напоминаний по событиям этой семьи не получает,
+    а менять он вправе только свои настройки — события чужой семьи ему не
+    принадлежат. Сохранённая «на будущее» строка reminder_overrides к тому же
+    неожиданно применилась бы, если бы аккаунт позже вошёл в семью.
+    """
+    repos = build_repos()
+    _, _, father_event = await _family_with_member_event(repos)
+    outsider_account = await repos.account.save(
+        Account(
+            id=0,
+            telegram_user_id=999,
+            current_family_id=None,
+            timezone="Europe/Moscow",
+            offsets_days=DEFAULT_OFFSETS_DAYS,
+            time_of_day=time(9, 0),
+        )
+    )
+    before = _snapshot(repos)
+
+    with pytest.raises(ValueError):
+        await _set_override(
+            repos,
+            account_id=outsider_account.id,
+            event_id=father_event.id,
+            offsets_days=(2,),
+            time_of_day=time(8, 0),
+        )
+
+    assert _snapshot(repos) == before
+    assert await repos.override.get(outsider_account.id, father_event.id) is None
