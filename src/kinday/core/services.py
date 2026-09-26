@@ -763,6 +763,112 @@ async def revoke_invite(
         await invite_repo.revoke(invite_id, clock.now())
 
 
+def _require_usable_invite(invite: Invite | None, now: datetime) -> Invite:
+    """Отказы по самому коду (SPEC 3.2, критерий приёмки 25): нет, отозван, использован, просрочен.
+
+    Общая проверка для `preview_invite` и `accept_invite`: бот показывает
+    «Антон приглашает вас как Марину» до подтверждения, и обе стороны обязаны
+    отклонять один и тот же набор кодов — иначе бот спросил бы часовой пояс по
+    коду, который сценарий всё равно не примет.
+    """
+    if invite is None:
+        raise ValueError("Приглашение не найдено")
+    if invite.revoked_at is not None:
+        raise ValueError("Приглашение отозвано")
+    if invite.used_at is not None:
+        raise ValueError("Приглашение уже использовано")
+    if now > invite.expires_at:
+        raise ValueError("Приглашение просрочено")
+    return invite
+
+
+async def _require_invited_person(invite: Invite, person_repo: PersonRepo) -> Person:
+    """Запись, на которую выдан код: её может уже не быть или она стала заглушкой (SPEC 3.2).
+
+    Ищется среди людей семьи, а не через PersonRepo.get: тот обязан вернуть
+    Person и на отсутствующий id ответит ошибкой хранилища, а здесь нужен
+    обычный отказ сценария.
+    """
+    person = next(
+        (p for p in await person_repo.list_by_family(invite.family_id) if p.id == invite.person_id),
+        None,
+    )
+    if person is None:
+        raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
+    if person.is_placeholder:
+        raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
+    return person
+
+
+@dataclass(frozen=True, slots=True)
+class InvitePreview:
+    """Кто кого приглашает — то, что бот показывает до подтверждения (SPEC 3.2)."""
+
+    family_id: int
+    person_id: int
+    person_name: str
+    inviter_name: str | None
+
+
+async def preview_invite(
+    code: str,
+    telegram_user_id: int,
+    invite_repo: InviteRepo,
+    person_repo: PersonRepo,
+    account_repo: AccountRepo,
+    family_repo: FamilyRepo,
+    membership_repo: MembershipRepo,
+    clock: Clock,
+) -> InvitePreview:
+    """Проверяет код и возвращает имена для строки «Антон приглашает вас как Марину».
+
+    Отказы те же, что у accept_invite (кроме неизвестного пояса — его тут ещё не
+    спрашивали): смысл в том, чтобы бот отклонил негодный код до вопроса про
+    часовой пояс, а не после. Ничего не пишет, поэтому единицы работы не
+    открывает.
+
+    Имя приглашающего — это запись владельца семьи в ней же. Её может не быть
+    (владелец не может удалить собственную запись, но семья могла быть заведена
+    иначе), поэтому `inviter_name` необязательное: бот тогда обходится одним
+    именем получателя.
+    """
+    invite = _require_usable_invite(await invite_repo.get_by_code(code), clock.now())
+    if await membership_repo.get_by_person(invite.person_id) is not None:
+        raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
+    person = await _require_invited_person(invite, person_repo)
+
+    account = await account_repo.get_by_telegram_user_id(telegram_user_id)
+    if (
+        account is not None
+        and await membership_repo.get_by_account_and_family(account.id, invite.family_id)
+        is not None
+    ):
+        raise ValueError(f"Аккаунт {account.id} уже состоит в семье {invite.family_id}")
+
+    family = await family_repo.get(invite.family_id)
+    owner = await membership_repo.get_by_account_and_family(
+        family.owner_account_id, invite.family_id
+    )
+    inviter_name: str | None = None
+    if owner is not None:
+        inviter = next(
+            (
+                p
+                for p in await person_repo.list_by_family(invite.family_id)
+                if p.id == owner.person_id
+            ),
+            None,
+        )
+        inviter_name = None if inviter is None else inviter.name
+
+    return InvitePreview(
+        family_id=invite.family_id,
+        person_id=invite.person_id,
+        person_name=person.name or "",
+        inviter_name=inviter_name,
+    )
+
+
 async def accept_invite(
     code: str,
     telegram_user_id: int,
@@ -813,35 +919,11 @@ async def accept_invite(
     async with uow:
         _require_known_timezone(timezone)
 
-        invite = await invite_repo.get_by_code(code)
-        if invite is None:
-            raise ValueError("Приглашение не найдено")
-
         now = clock.now()
-        if invite.revoked_at is not None:
-            raise ValueError("Приглашение отозвано")
-        if invite.used_at is not None:
-            raise ValueError("Приглашение уже использовано")
-        if now > invite.expires_at:
-            raise ValueError("Приглашение просрочено")
+        invite = _require_usable_invite(await invite_repo.get_by_code(code), now)
         if await membership_repo.get_by_person(invite.person_id) is not None:
             raise ValueError(f"Запись {invite.person_id} уже привязана к аккаунту")
-
-        # Запись ищется среди людей семьи, а не через PersonRepo.get: тот обязан
-        # вернуть Person и на отсутствующий id ответит ошибкой хранилища, а здесь
-        # нужен обычный отказ сценария.
-        person = next(
-            (
-                p
-                for p in await person_repo.list_by_family(invite.family_id)
-                if p.id == invite.person_id
-            ),
-            None,
-        )
-        if person is None:
-            raise ValueError(f"Запись {invite.person_id} не найдена — приглашение недействительно")
-        if person.is_placeholder:
-            raise ValueError(f"Запись {invite.person_id} — заглушка неизвестного родителя")
+        person = await _require_invited_person(invite, person_repo)
 
         account = await account_repo.get_by_telegram_user_id(telegram_user_id)
         if account is None:
