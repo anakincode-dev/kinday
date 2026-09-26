@@ -142,7 +142,7 @@ in-memory реализаций (общие фикстуры, разные реп
 
 Готово: критерии приёмки 8–13 проходят.
 
-## Этап 6. Telegram-слой
+## Этап 6. Telegram-слой (готово)
 
 - `telegram/notifier.py`: `TelegramNotifier` поверх aiogram (добавляется
   зависимость `aiogram` через `uv add`), перевод 403 в `RecipientBlocked`.
