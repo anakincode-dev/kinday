@@ -268,6 +268,9 @@ class FakeInviteRepo:
     async def get_by_code(self, code: str) -> Invite | None:
         return next((i for i in self.invites.values() if i.code == code), None)
 
+    async def list_by_person(self, person_id: int) -> list[Invite]:
+        return [i for i in self.invites.values() if i.person_id == person_id]
+
     async def create(self, invite: Invite) -> Invite:
         invite.id = self._next_id
         self._next_id += 1
