@@ -5,8 +5,8 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from kinday.core.models import Account, Event, EventKind, Membership, ReminderStatus
-from kinday.core.reminders import due_at_utc, materialize_for_event
+from kinday.core.models import Account, Event, EventKind, Membership, Reminder, ReminderStatus
+from kinday.core.reminders import MISFIRE_GRACE, due_at_utc, is_overdue, materialize_for_event
 
 
 class FixedClock:
@@ -277,3 +277,40 @@ def test_materialize_for_event_only_builds_future_occurrences() -> None:
 
     assert all(r.occurrence_date >= clock.now().date() for r in reminders)
     assert date(2027, 3, 1) not in {r.occurrence_date for r in reminders}
+
+
+def _reminder(occurrence: date, due: datetime) -> Reminder:
+    return Reminder(
+        id=1, event_id=100, person_id=1, offset_days=0, occurrence_date=occurrence, due_at_utc=due
+    )
+
+
+def test_is_overdue_false_for_fresh_reminder() -> None:
+    """Опоздание на два часа просрочкой не считается — напоминание ещё уходит (критерий 12)."""
+    reminder = _reminder(date(2027, 3, 1), datetime(2027, 3, 1, 6, tzinfo=UTC))
+
+    assert is_overdue(reminder, datetime(2027, 3, 1, 8, tzinfo=UTC), "Europe/Moscow") is False
+
+
+def test_is_overdue_true_after_misfire_grace() -> None:
+    """Простой дольше MISFIRE_GRACE: срок устарел, напоминание пропускается."""
+    reminder = _reminder(date(2027, 3, 1), datetime(2027, 3, 1, 6, tzinfo=UTC))
+    late = datetime(2027, 3, 1, 6, tzinfo=UTC) + timedelta(seconds=MISFIRE_GRACE + 1)
+
+    assert is_overdue(reminder, late, "Europe/Moscow") is True
+
+
+def test_is_overdue_true_when_occurrence_date_already_passed() -> None:
+    """Вторая ветка просрочки: срок свежий, но дата события в поясе получателя уже прошла.
+
+    Напоминание «в день события» 1 марта должно было уйти в 09:00 по Москве,
+    а тик добрался до него через шестнадцать часов — по московскому времени уже
+    2 марта, и сообщение «сегодня день рождения» говорило бы о прошедшем дне.
+    Простой при этом меньше MISFIRE_GRACE, так что первая ветка молчит.
+    """
+    reminder = _reminder(date(2027, 3, 1), datetime(2027, 3, 1, 6, tzinfo=UTC))
+    late = datetime(2027, 3, 1, 22, tzinfo=UTC)
+
+    assert is_overdue(reminder, late, "Europe/Moscow") is True
+    # Тот же момент в поясе западнее: там всё ещё 1 марта, просрочки нет.
+    assert is_overdue(reminder, late, "America/New_York") is False

@@ -12,8 +12,9 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import replace
-from datetime import date, time, timedelta
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
+from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kinday.core.models import (
@@ -45,8 +46,21 @@ from kinday.core.ports import (
     ReminderRepo,
     UnitOfWork,
 )
-from kinday.core.relations import RelationKind, add_sibling, add_spouse, attach_parent
-from kinday.core.reminders import MISFIRE_GRACE, materialize_for_event
+from kinday.core.recurrence import age_on
+from kinday.core.relations import (
+    RelationKind,
+    add_sibling,
+    add_spouse,
+    attach_parent,
+    infer_relation_text,
+)
+from kinday.core.reminders import (
+    MISFIRE_GRACE,
+    apply_override,
+    is_overdue,
+    materialize_for_event,
+)
+from kinday.core.texts import reminder_text
 
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
@@ -432,11 +446,7 @@ async def _rematerialize_event_for_person(
     индекс (SPEC 5.3), и смена настроек молча не применилась бы к этой строке.
     """
     override = await override_repo.get(membership.account_id, event.id)
-    effective_account = account
-    if override is not None:
-        effective_account = replace(
-            account, offsets_days=override.offsets_days, time_of_day=override.time_of_day
-        )
+    effective_account = apply_override(account, override)
     await reminder_repo.delete_future_pending_for_event_and_person(
         event.id, membership.person_id, clock.now() - timedelta(seconds=MISFIRE_GRACE)
     )
@@ -1090,3 +1100,99 @@ async def set_current_family(
         account = await account_repo.get(account_id)
         account.current_family_id = family_id
         return await account_repo.save(account)
+
+
+class SkipReason(Enum):
+    """Почему напоминание не отправляется (SPEC 5.5).
+
+    MISSED — срок прошёл: простой сервиса дольше суток или дата события уже
+    позади, отправлять поздно. UNDELIVERABLE — отправлять некуда: у записи
+    получателя больше нет аккаунта, у аккаунта нет привязанного чата или
+    доставка ему отключена после 403. Разница важна тику: в первом случае
+    строка закрывается как missed, во втором как failed.
+    """
+
+    MISSED = "missed"
+    UNDELIVERABLE = "undeliverable"
+
+
+@dataclass(frozen=True, slots=True)
+class SendPlan:
+    """Что тику отправить по одному напоминанию: куда, какой текст и чей аккаунт.
+
+    `account_id` нужен на случай 403: доставка отключается аккаунту получателя
+    (disable_delivery), а искать его заново по напоминанию тику уже не надо.
+    """
+
+    account_id: int
+    chat_id: int
+    text: str
+
+
+async def plan_reminder_delivery(
+    reminder: Reminder,
+    at: datetime,
+    account_repo: AccountRepo,
+    event_repo: EventRepo,
+    membership_repo: MembershipRepo,
+    person_repo: PersonRepo,
+    relation_repo: RelationRepo,
+) -> SendPlan | SkipReason:
+    """Собирает текст и адрес одной отправки на момент `at` — либо причину не отправлять.
+
+    Вызывается тиком после claim и до send (SPEC 5.5), поэтому ничего не пишет:
+    единственная задача — превратить строку `reminders` в готовое сообщение.
+
+    Текст считается на момент отправки, а не материализации (критерий приёмки
+    13): «через N дней» берётся из даты в поясе получателя прямо сейчас, так
+    что напоминание, ушедшее с опозданием через сутки, говорит о сутках
+    меньших. Родство выводится так же на момент отправки — дерево могло
+    измениться после материализации.
+    """
+    membership = await membership_repo.get_by_person(reminder.person_id)
+    if membership is None:
+        return SkipReason.UNDELIVERABLE
+    account = await account_repo.get(membership.account_id)
+    # Просрочка проверяется раньше доставки: строка, у которой срок прошёл,
+    # по SPEC 5.5 становится missed независимо от того, куда её собирались
+    # отправить. Иначе аккаунт, заблокировавший бота во время простоя, получил
+    # бы failed там, где критерий приёмки 12 требует missed.
+    if is_overdue(reminder, at, account.timezone):
+        return SkipReason.MISSED
+    if not account.delivery_enabled or account.chat_id is None:
+        return SkipReason.UNDELIVERABLE
+
+    event = await event_repo.get(reminder.event_id)
+    people = {person.id: person for person in await person_repo.list_by_family(event.family_id)}
+    relations = await relation_repo.list_by_family(event.family_id)
+    hero = people[event.person_id]
+
+    days_until = (reminder.occurrence_date - at.astimezone(ZoneInfo(account.timezone)).date()).days
+    text = reminder_text(
+        name=hero.name or "",
+        relation_phrase=infer_relation_text(
+            membership.person_id, event.person_id, people, relations
+        ),
+        days_until=days_until,
+        event_title=event.title,
+        is_birthday=event.is_birthday,
+        is_recurring_yearly=event.is_recurring_yearly,
+        event_date=reminder.occurrence_date,
+        years=age_on(event.date, reminder.occurrence_date),
+    )
+    return SendPlan(account_id=account.id, chat_id=account.chat_id, text=text)
+
+
+async def disable_delivery(account_id: int, account_repo: AccountRepo) -> None:
+    """403: получатель заблокировал бота — снимаем привязку чата и отключаем доставку.
+
+    SPEC 5.5: новых напоминаний такому аккаунту не строят (materialize_for_event
+    пропускает delivery_enabled=False), а уже построенные тик закрывает как
+    failed. Доставка включится снова, когда аккаунт заново запустит бота.
+
+    Без UnitOfWork: это одна строка, и вызывает её тик, где каждый шаг
+    (claim, send, mark) фиксируется отдельно и сетевой вызов не держит
+    транзакцию (SPEC 5.5).
+    """
+    account = await account_repo.get(account_id)
+    await account_repo.save(replace(account, chat_id=None, delivery_enabled=False))
