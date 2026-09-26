@@ -1,9 +1,14 @@
-"""core — чистый Python: не импортирует Telegram/SQLite/APScheduler и внешние слои.
+"""Границы слоёв: core — чистый Python, роутеры не знают SQL.
 
 Правило из SPEC.md 5.1: зависимости направлены внутрь, ядро о внешних слоях
 не знает. Тест разбирает AST модулей core, а не просто ищет подстроки, чтобы
 не зависеть от форматирования импортов. Учитываются относительные импорты
 (`from . import x`) и импорт подмодуля через пакет (`from kinday import storage`).
+
+Вторая граница — обратная: handler'ы в `telegram/` переводят апдейты в вызовы
+сценариев ядра и форматируют ответы, поэтому хранилище им недоступно. Сборка
+зависимостей (`telegram/bot.py`) — единственное исключение: где-то репозитории
+SQLite всё равно приходится подставлять в порты ядра.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from pathlib import Path
 
 SRC_DIR = Path(__file__).parent.parent / "src"
 CORE_DIR = SRC_DIR / "kinday" / "core"
+TELEGRAM_DIR = SRC_DIR / "kinday" / "telegram"
 
 FORBIDDEN_ROOTS = {
     "aiogram",
@@ -22,6 +28,16 @@ FORBIDDEN_ROOTS = {
     "kinday.scheduler",
     "kinday.telegram",
 }
+
+# Чего не знают handler'ы: ни SQL напрямую, ни репозиториев SQLite, ни
+# планировщика. Тик — сосед по внешнему слою, а не слой под роутерами: отправкой
+# распоряжается он сам, и вызов оттуда обошёл бы всю логику трёх шагов (SPEC 5.5).
+FORBIDDEN_FOR_TELEGRAM = {"sqlite3", "kinday.storage", "kinday.scheduler"}
+
+# Сборка зависимостей: единственное место в слое, которое знает и aiogram, и SQLite.
+# Путь, а не имя файла: иначе любой будущий `telegram/что-то/bot.py` тоже выпал бы
+# из проверки, хотя сборкой зависимостей не является.
+TELEGRAM_WIRING = {"bot.py"}
 
 
 def _module_name(path: Path) -> str:
@@ -91,3 +107,26 @@ def test_core_does_not_import_outer_layers() -> None:
                 violations.append(f"{path.relative_to(CORE_DIR)} импортирует {module_name}")
 
     assert not violations, "core импортирует внешние слои:\n" + "\n".join(violations)
+
+
+def test_telegram_handlers_do_not_touch_storage() -> None:
+    """Роутеры не работают с базой: только вызовы сценариев ядра и форматирование ответов.
+
+    Доменные правила глазами теста не увидеть, а вот попытку сходить в базу
+    мимо ядра — вполне: она начинается с импорта `sqlite3` или `kinday.storage`.
+    """
+    paths = sorted(
+        path
+        for path in TELEGRAM_DIR.rglob("*.py")
+        if str(path.relative_to(TELEGRAM_DIR)) not in TELEGRAM_WIRING
+    )
+    assert paths, f"В {TELEGRAM_DIR} не найдено ни одного файла .py — проверка ничего не проверяет"
+
+    violations: list[str] = []
+    for path in paths:
+        for module_name in _imported_names(path):
+            for forbidden in FORBIDDEN_FOR_TELEGRAM:
+                if module_name == forbidden or module_name.startswith(forbidden + "."):
+                    violations.append(f"{path.relative_to(TELEGRAM_DIR)} импортирует {module_name}")
+
+    assert not violations, "слой telegram лезет в хранилище мимо ядра:\n" + "\n".join(violations)

@@ -134,7 +134,8 @@ async def _handle_one(
             reminder.attempts,
         )
         async with unit_of_work:
-            await reminder_repo.mark_failed(reminder.id, now)
+            # Отправки сейчас не было: счётчик и так исчерпан, трогать его нечем.
+            await reminder_repo.mark_failed(reminder.id, now, attempted=False)
         return True
 
     try:
@@ -150,7 +151,8 @@ async def _handle_one(
     except Exception:
         logger.exception("Не удалось собрать напоминание %s, помечено failed", reminder.id)
         async with unit_of_work:
-            await reminder_repo.mark_failed(reminder.id, now)
+            # До Telegram дело не дошло: если данные починятся, /start вернёт строку.
+            await reminder_repo.mark_failed(reminder.id, now, attempted=False)
         return True
 
     if plan is SkipReason.MISSED:
@@ -161,7 +163,9 @@ async def _handle_one(
     if plan is SkipReason.UNDELIVERABLE:
         logger.info("Напоминание %s отправлять некуда, помечено failed", reminder.id)
         async with unit_of_work:
-            await reminder_repo.mark_failed(reminder.id, now)
+            # Чата нет или доставка выключена — отправки не было. Появится чат,
+            # и /start вернёт строку, если она опоздала меньше чем на сутки.
+            await reminder_repo.mark_failed(reminder.id, now, attempted=False)
         return True
     return await _send_one(
         reminder.id,
@@ -211,7 +215,10 @@ async def _send_one(
         await notifier.send(plan.chat_id, plan.text)
     except RecipientBlocked:
         async with unit_of_work:
-            await reminder_repo.mark_failed(reminder_id, now)
+            # Отправка была, пусть и отвергнута: строку воскрешать не за что,
+            # а счётчик отличает её от закрытых заодно с ней ниже, в
+            # disable_delivery, — те вернутся при следующем /start.
+            await reminder_repo.mark_failed(reminder_id, now, attempted=True)
             closed = await disable_delivery(
                 plan.account_id, now, account_repo, membership_repo, reminder_repo
             )
@@ -227,7 +234,8 @@ async def _send_one(
         async with unit_of_work:
             await reminder_repo.release(reminder_id)
             if attempts + 1 >= MAX_ATTEMPTS:
-                await reminder_repo.mark_failed(reminder_id, now)
+                # release уже учёл эту попытку — второй раз её считать нельзя.
+                await reminder_repo.mark_failed(reminder_id, now, attempted=False)
         if attempts + 1 >= MAX_ATTEMPTS:
             logger.warning(
                 "Напоминание %s не отправлено с %s попыток, помечено failed: %s",
@@ -243,7 +251,8 @@ async def _send_one(
             "Неизвестная ошибка отправки напоминания %s: повторно не отправляем", reminder_id
         )
         async with unit_of_work:
-            await reminder_repo.mark_failed(reminder_id, now)
+            # send вызывался, а чем кончился — неизвестно: повторять нельзя.
+            await reminder_repo.mark_failed(reminder_id, now, attempted=True)
         return True
     async with unit_of_work:
         await reminder_repo.mark_sent(reminder_id, now)

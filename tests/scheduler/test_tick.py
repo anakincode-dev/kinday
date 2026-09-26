@@ -12,6 +12,7 @@ PLAN.md, этап 5. Критерии приёмки: 8 (повторный ти
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from types import TracebackType
@@ -28,7 +29,7 @@ from tests.scenarios import (
     issue_invite_in,
 )
 
-from kinday.core.models import ReminderStatus
+from kinday.core.models import Gender, Reminder, ReminderStatus
 from kinday.core.ports import Clock, Notifier, RecipientBlocked, TransportError, UnitOfWork
 from kinday.core.relations import RelationKind
 from kinday.scheduler.tick import MAX_ATTEMPTS, fail_stuck_sending, run_tick
@@ -37,6 +38,10 @@ ANTON_CHAT_ID = 500
 PETR_CHAT_ID = 501
 ANTON_BIRTH = date(1990, 6, 15)
 PETR_BIRTH = date(1980, 3, 1)
+# 8 марта выбрано так, чтобы «за 7 дней» по Марине пришлось на ту же минуту,
+# что и «в день» по Петру: это и есть обычный случай, когда 403 на одной строке
+# закрывает заодно другую, по которой отправки не было.
+MARINA_BIRTH = date(1985, 3, 8)
 
 # Дата выбрана как в SPEC 9: день рождения Антона в окно теста не попадает,
 # а до дня рождения Петра (1 марта) остаётся чуть больше двух недель.
@@ -46,8 +51,26 @@ START = datetime(2027, 2, 15, tzinfo=UTC)
 DUE_SEVEN_DAYS = datetime(2027, 2, 22, 6, tzinfo=UTC)
 # То же самое за один день.
 DUE_ONE_DAY = datetime(2027, 2, 28, 6, tzinfo=UTC)
+# И в сам день рождения Петра — сюда же попадает «за 7 дней» по Марине.
+DUE_BIRTHDAY = datetime(2027, 3, 1, 6, tzinfo=UTC)
 
 SEVEN_DAYS_TEXT = "Через 7 дней день рождения — Пётр, ваш отец. 1 марта, исполнится 47."
+MARINA_SEVEN_DAYS_TEXT = "Через 7 дней день рождения — Марина, ваша мать. 8 марта, исполнится 42."
+
+
+class _ProcessDied(BaseException):
+    """Смерть процесса посреди тика: намеренно не Exception, чтобы тик её не ловил."""
+
+
+@dataclass
+class _CrashingNotifier:
+    """Сообщение ушло, и тут же умер процесс — то самое окно между send и mark."""
+
+    sent: list[tuple[int, str]] = field(default_factory=list)
+
+    async def send(self, chat_id: int, text: str) -> None:
+        self.sent.append((chat_id, text))
+        raise _ProcessDied
 
 
 async def _family_with_father(world: World, clock: Clock) -> tuple[int, int, int]:
@@ -198,6 +221,70 @@ async def test_sending_row_fails_on_startup_and_is_not_resent(world: World) -> N
     assert statuses.count(ReminderStatus.FAILED) == 1
     [failed] = [r for r in await world.read_reminders() if r.status == ReminderStatus.FAILED]
     assert failed.due_at_utc == DUE_SEVEN_DAYS
+
+
+@pytest.mark.asyncio
+async def test_start_after_crash_does_not_resend_the_lost_message(world: World) -> None:
+    """Критерий 9 и /start вместе: перезапуск плюс повторный запуск бота не шлют второй раз.
+
+    Самое опасное сочетание: сообщение ушло, процесс умер до mark, строка
+    осталась в sending. Перезапуск закрывает её как failed — и тут пользователь
+    жмёт /start. Если возобновление доставки удаляет такие строки и строит
+    горизонт заново, строка снова станет pending, и тик отправит то же
+    сообщение второй раз. SPEC 5.5 это запрещает: повторная отправка хуже
+    пропуска.
+    """
+    clock = FixedClock(START)
+    _, account_id, _ = await _family_with_father(world, clock)
+    crashing = _CrashingNotifier()
+
+    clock.move_to(DUE_SEVEN_DAYS)
+    with pytest.raises(_ProcessDied):
+        await _tick(world, clock, crashing)
+    assert len(crashing.sent) == 1, "сообщение успело уйти до падения"
+    [stuck] = [r for r in await world.read_reminders() if r.due_at_utc == DUE_SEVEN_DAYS]
+    assert stuck.status == ReminderStatus.SENDING
+
+    # Перезапуск сервиса: строка закрывается как failed (критерий 9).
+    await fail_stuck_sending(clock, world.reminder)
+    # И сразу /start: доставка и так включена, 403 не было — пересчитывать нечего.
+    await enable_delivery_in(world, clock=clock, account_id=account_id, chat_id=ANTON_CHAT_ID)
+
+    notifier = RecordingNotifier()
+    await _tick(world, clock, notifier)
+
+    assert notifier.sent == [], "то же сообщение отправлено второй раз"
+    [row] = [r for r in await world.read_reminders() if r.due_at_utc == DUE_SEVEN_DAYS]
+    assert row.status == ReminderStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_revive_rows_failed_after_five_attempts(world: World) -> None:
+    """Пять сетевых попыток исчерпаны — /start не даёт шестую (SPEC 5.5).
+
+    Строка закрыта как failed, но её `due_at_utc` уже в прошлом, и возобновление
+    доставки не имеет права трогать прошлое: сообщение могло дойти на любой из
+    попыток, транспорт ответил сбоем, а не отказом.
+    """
+    clock = FixedClock(START)
+    _, account_id, _ = await _family_with_father(world, clock)
+    broken = RecordingNotifier(error=TransportError("сеть недоступна"))
+
+    clock.move_to(DUE_SEVEN_DAYS)
+    for attempt in range(MAX_ATTEMPTS):
+        clock.move_to(DUE_SEVEN_DAYS + timedelta(minutes=attempt))
+        await _tick(world, clock, broken)
+    [exhausted] = [r for r in await world.read_reminders() if r.due_at_utc == DUE_SEVEN_DAYS]
+    assert (exhausted.status, exhausted.attempts) == (ReminderStatus.FAILED, MAX_ATTEMPTS)
+
+    await enable_delivery_in(world, clock=clock, account_id=account_id, chat_id=ANTON_CHAT_ID)
+
+    notifier = RecordingNotifier()
+    await _tick(world, clock, notifier)
+
+    assert notifier.sent == []
+    [row] = [r for r in await world.read_reminders() if r.due_at_utc == DUE_SEVEN_DAYS]
+    assert (row.status, row.attempts) == (ReminderStatus.FAILED, MAX_ATTEMPTS)
 
 
 @pytest.mark.asyncio
@@ -482,10 +569,129 @@ async def test_delivery_resumes_after_account_returns(world: World) -> None:
     assert notifier.sent == [
         (ANTON_CHAT_ID, "Завтра день рождения — Пётр, ваш отец. 1 марта, исполнится 47.")
     ]
-    # Строка, на которой пришёл 403, восстановлена вместе с остальным горизонтом, но
-    # за сутки простоя просрочилась и закрылась как missed — повторно её не слали.
+    # Строка, на которой пришёл 403, так и осталась failed: её срок уже наступил,
+    # попытка отправки была, и возобновление доставки прошлое не переписывает.
+    # Восстанавливается только будущее — иначе строку, про которую неизвестно,
+    # дошла ли она, отправили бы повторно.
     [overdue] = [r for r in await world.read_reminders() if r.due_at_utc == DUE_SEVEN_DAYS]
-    assert overdue.status == ReminderStatus.MISSED
+    assert overdue.status == ReminderStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_start_restores_reminder_closed_alongside_the_blocked_one(world: World) -> None:
+    """403 закрывает и чужие строки без попытки отправки: /start обязан их вернуть.
+
+    `disable_delivery` закрывает как failed ВСЕ pending-строки аккаунта, а не
+    только ту, на которой пришёл 403. Напоминания одного аккаунта приходятся на
+    одно местное время, так что в одну минуту их обычно несколько: по одной
+    отправка была, по остальным — нет.
+
+    Такую строку /start обязан вернуть: отправки не было, опоздание меньше
+    суток, дата события впереди — SPEC 4 и критерий приёмки 12 требуют доставки.
+    Отличить её от строки, по которой отправка была, можно только по `attempts`.
+    """
+    clock = FixedClock(START)
+    family_id, account_id, petr_id = await _family_with_father(world, clock)
+    [anton] = [p for p in await world.person.list_by_family(family_id) if p.id != petr_id]
+    marina = await add_person_to(
+        world,
+        clock=clock,
+        acting_account_id=account_id,
+        family_id=family_id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=MARINA_BIRTH,
+        relation_kind=RelationKind.MOTHER,
+        relative_to_person_id=anton.id,
+    )
+    notifier = RecordingNotifier()
+
+    # Прошлые сроки Петра разбираются как обычно, чтобы к дню рождения остались
+    # ровно две строки на одну минуту: «в день» по Петру и «за 7 дней» по Марине.
+    for due in (DUE_SEVEN_DAYS, DUE_ONE_DAY):
+        clock.move_to(due)
+        await _tick(world, clock, notifier)
+
+    notifier.error = RecipientBlocked("бот заблокирован")
+    clock.move_to(DUE_BIRTHDAY)
+    await _tick(world, clock, notifier)
+
+    # Строки различаются по событию: person_id в напоминании — получатель (Антон),
+    # а не юбиляр.
+    [petr_event] = await world.event.list_by_person(petr_id)
+    [marina_event] = await world.event.list_by_person(marina.id)
+
+    # В горизонт попадает и следующий год, поэтому в ключе ещё и срок.
+    async def by_event() -> dict[tuple[int, datetime], Reminder]:
+        return {(r.event_id, r.due_at_utc): r for r in await world.read_reminders()}
+
+    rows = await by_event()
+    blocked = rows[(petr_event.id, DUE_BIRTHDAY)]
+    collateral = rows[(marina_event.id, DUE_BIRTHDAY)]
+    assert blocked.status == ReminderStatus.FAILED
+    assert collateral.status == ReminderStatus.FAILED
+    # Отправки по строке Марины не было: тик до неё не дошёл.
+    assert collateral.attempts == 0
+    # А по строке Петра была — именно на ней пришёл 403.
+    assert blocked.attempts == 1
+
+    notifier.error = None
+    notifier.sent.clear()
+    clock.move_to(DUE_BIRTHDAY + timedelta(minutes=10))
+    await enable_delivery_in(world, clock=clock, account_id=account_id, chat_id=ANTON_CHAT_ID)
+    await _tick(world, clock, notifier)
+
+    # Напоминание про Марину уходит с опозданием в десять минут, как требует
+    # критерий 12, а про Петра — нет: по нему попытка уже была.
+    assert notifier.sent == [(ANTON_CHAT_ID, MARINA_SEVEN_DAYS_TEXT)]
+    rows = await by_event()
+    assert rows[(marina_event.id, DUE_BIRTHDAY)].status == ReminderStatus.SENT
+    assert rows[(petr_event.id, DUE_BIRTHDAY)].status == ReminderStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_log_keeps_ids_and_no_personal_data(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """В журнал идут только id: ни имён из дерева, ни текстов напоминаний.
+
+    Требование к этапу 6 (в SPEC.md отдельного пункта нет): журнал сервиса
+    переживает сами напоминания и читается людьми, которые к семье отношения не
+    имеют, поэтому имена и готовые тексты в него не попадают — по id строки и
+    аккаунта разобраться в происшедшем можно и без них.
+
+    Прогоняются самые говорливые ветки тика: сетевой сбой, исчерпанные попытки,
+    403 с отключением доставки и неизвестная ошибка отправки — последняя пишется
+    через `logger.exception`, то есть вместе с трассировкой. Поэтому проверяется
+    `caplog.text`, а не только сами сообщения: трассировка — такой же текст в
+    журнале, и утечь она может наравне с форматной строкой.
+    """
+    clock = FixedClock(START)
+    _, account_id, _ = await _family_with_father(world, clock)
+    notifier = RecordingNotifier(error=TransportError("таймаут"))
+
+    with caplog.at_level(logging.DEBUG):
+        for minute in range(MAX_ATTEMPTS):
+            clock.move_to(DUE_SEVEN_DAYS + timedelta(minutes=minute))
+            await _tick(world, clock, notifier)
+
+        notifier.error = RuntimeError("транспорт сломался неожиданно")
+        clock.move_to(DUE_ONE_DAY)
+        await _tick(world, clock, notifier)
+
+        notifier.error = RecipientBlocked("бот заблокирован")
+        clock.move_to(DUE_ONE_DAY + timedelta(days=1))
+        await _tick(world, clock, notifier)
+
+        await fail_stuck_sending(clock, world.reminder)
+
+    journal = caplog.text
+    assert "Traceback" in journal, "ветка logger.exception не сработала, проверять нечего"
+    for secret in ("Пётр", "Антон", SEVEN_DAYS_TEXT, "день рождения", "исполнится"):
+        assert secret not in journal
+    # Идентификаторы, наоборот, нужны: без них запись бесполезна. Аккаунт по id
+    # называет ветка 403 — она же единственная, где в журнал идёт не только строка.
+    assert f"Аккаунт {account_id}" in journal
 
 
 @pytest.mark.asyncio

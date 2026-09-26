@@ -25,10 +25,12 @@ from kinday.core.models import (
     Membership,
     ParentOf,
     Person,
+    Reminder,
     ReminderStatus,
     SpouseOf,
 )
 from kinday.core.relations import RelationKind
+from kinday.core.reminders import MISFIRE_GRACE
 from kinday.core.services import (
     DEFAULT_OFFSETS_DAYS,
     NotFamilyOwner,
@@ -36,6 +38,8 @@ from kinday.core.services import (
     add_person,
     create_family,
     delete_person,
+    disable_delivery,
+    enable_delivery,
     issue_invite,
     revoke_invite,
     set_current_family,
@@ -1841,3 +1845,115 @@ async def test_set_override_rejects_account_without_membership() -> None:
 
     assert _snapshot(repos) == before
     assert await repos.override.get(outsider_account.id, father_event.id) is None
+
+
+@pytest.mark.asyncio
+async def test_start_with_delivery_already_on_only_binds_chat() -> None:
+    """/start живого аккаунта обновляет чат и не касается напоминаний (SPEC 5.5).
+
+    Пересчёт нужен только как обратный путь к 403. Для аккаунта, у которого
+    доставка и так включена, удаление с перестройкой горизонта — лишний риск:
+    /start приходит когда угодно, в том числе через минуту после отправки, и
+    воскресшая строка ушла бы вторым сообщением. Сохранившиеся id напоминаний
+    доказывают, что строки те же, а не построенные заново.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [anton] = repos.person.people.values()
+    [account] = repos.account.accounts.values()
+    await _add_person(
+        repos,
+        acting_account_id=account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=anton.id,
+    )
+    before = deepcopy(repos.reminder.reminders)
+    assert before, "горизонт построен, иначе проверка пуста"
+    assert account.delivery_enabled
+
+    updated = await enable_delivery(
+        account.id,
+        777,
+        repos.account,
+        repos.membership,
+        repos.event,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+        repos.uow,
+    )
+
+    assert (updated.chat_id, updated.delivery_enabled) == (777, True)
+    assert repos.reminder.reminders == before
+
+
+@pytest.mark.asyncio
+async def test_start_rebuilds_only_rows_without_a_send_attempt() -> None:
+    """Обратный путь к 403: возвращается то, по чему отправки не было.
+
+    Строки в failed бывают двух сортов, и различает их `attempts`. По строке с
+    ненулевым счётчиком `send` вызывался: она могла быть отправлена до 403 или
+    до падения процесса, а повторная отправка хуже пропуска (SPEC 5.5), — такая
+    строка остаётся закрытой, даже опоздав на минуту. Строка с нулевым
+    счётчиком закрыта заодно с ней, и при опоздании меньше суток SPEC 4
+    требует её доставить.
+    """
+    repos = build_repos()
+    family = await _create_family(
+        repos, telegram_user_id=111, name="Антон", birth_date=date(1990, 6, 15)
+    )
+    [anton] = repos.person.people.values()
+    [account] = repos.account.accounts.values()
+    await _add_person(
+        repos,
+        acting_account_id=account.id,
+        family_id=family.id,
+        name="Пётр",
+        gender=Gender.MALE,
+        birth_date=date(1960, 3, 1),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=anton.id,
+    )
+    now = CLOCK.now()
+    # 403: весь построенный горизонт закрыт как failed, чат снят.
+    await disable_delivery(account.id, now, repos.account, repos.membership, repos.reminder)
+    assert {r.status for r in repos.reminder.reminders} == {ReminderStatus.FAILED}
+    # Три строки «уже наступили» к моменту /start, остальные в будущем.
+    horizon = sorted(repos.reminder.reminders, key=lambda r: r.due_at_utc)
+    attempted, unattempted, stale = horizon[:3]
+
+    def key(reminder: Reminder) -> tuple[int, int, date]:
+        return (reminder.event_id, reminder.offset_days, reminder.occurrence_date)
+
+    # По этой строке отправка была: 403 пришёл именно на ней.
+    attempted.due_at_utc = now - timedelta(minutes=1)
+    attempted.attempts = 1
+    # А эта закрыта заодно с ней, без единой попытки.
+    unattempted.due_at_utc = now - timedelta(minutes=1)
+    # Третья тоже без попытки, но опоздала больше суток: окно просрочки вышло.
+    stale.due_at_utc = now - timedelta(seconds=MISFIRE_GRACE + 60)
+    closed_keys = {key(attempted), key(stale)}
+
+    await enable_delivery(
+        account.id,
+        777,
+        repos.account,
+        repos.membership,
+        repos.event,
+        repos.override,
+        repos.reminder,
+        CLOCK,
+        repos.uow,
+    )
+
+    by_key = {key(r): r.status for r in repos.reminder.reminders}
+    assert {by_key[k] for k in closed_keys} == {ReminderStatus.FAILED}
+    assert {status for k, status in by_key.items() if k not in closed_keys} == {
+        ReminderStatus.PENDING
+    }

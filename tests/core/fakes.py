@@ -246,8 +246,11 @@ class FakeReminderRepo:
     async def mark_missed(self, reminder_id: int, at: datetime) -> None:
         self._by_id(reminder_id).status = ReminderStatus.MISSED
 
-    async def mark_failed(self, reminder_id: int, at: datetime) -> None:
-        self._by_id(reminder_id).status = ReminderStatus.FAILED
+    async def mark_failed(self, reminder_id: int, at: datetime, *, attempted: bool) -> None:
+        reminder = self._by_id(reminder_id)
+        reminder.status = ReminderStatus.FAILED
+        if attempted:
+            reminder.attempts += 1
 
     async def release(self, reminder_id: int) -> None:
         reminder = self._by_id(reminder_id)
@@ -312,16 +315,18 @@ class FakeReminderRepo:
     async def delete_all_for_person(self, person_id: int) -> None:
         self.reminders = [r for r in self.reminders if r.person_id != person_id]
 
-    async def delete_future_failed_for_person(self, person_id: int, after: datetime) -> None:
-        self.reminders = [
-            r
-            for r in self.reminders
-            if not (
-                r.person_id == person_id
-                and r.status == ReminderStatus.FAILED
-                and r.due_at_utc >= after
+    async def delete_recoverable_failed_for_person(
+        self, person_id: int, attempted_after: datetime, unattempted_after: datetime
+    ) -> None:
+        def recoverable(reminder: Reminder) -> bool:
+            after = attempted_after if reminder.attempts else unattempted_after
+            return (
+                reminder.person_id == person_id
+                and reminder.status == ReminderStatus.FAILED
+                and reminder.due_at_utc > after
             )
-        ]
+
+        self.reminders = [r for r in self.reminders if not recoverable(r)]
 
     async def fail_pending_for_person(self, person_id: int, at: datetime) -> int:
         closed = 0
@@ -336,6 +341,8 @@ class FakeReminderRepo:
         for reminder in self.reminders:
             if reminder.status == ReminderStatus.SENDING:
                 reminder.status = ReminderStatus.FAILED
+                # Отправка по такой строке шла: /start её не воскресит.
+                reminder.attempts += 1
                 closed += 1
         return closed
 
