@@ -34,6 +34,7 @@ PLACEHOLDER_ID = 100
 HALF_SIBLING_ID = 6
 HALF_SIBLING_OTHER_PARENT_ID = 7
 NEW_CHILD_ID = 8
+GRANDFATHER_ID = 9
 
 
 def _person(
@@ -181,6 +182,69 @@ def test_merge_placeholder_into_ignores_unrelated_edges() -> None:
     assert rewritten == [ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)]
 
 
+def test_merge_placeholder_into_moves_edges_upwards_and_spouse() -> None:
+    """Заглушка отдаёт настоящему родителю все свои рёбра, а не только рёбра к детям.
+
+    Ребро вверх и супружеское заглушка получает, когда в неё превратился
+    удалённый человек с детьми (SPEC 4.3). Не перенести их — значит молча
+    порвать родство внука с дедом: удаление заглушки утащит рёбра каскадом.
+    """
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=GRANDFATHER_ID, child_id=PLACEHOLDER_ID),
+        SpouseOf(a_id=MOTHER_ID, b_id=PLACEHOLDER_ID),
+    ]
+
+    rewritten = merge_placeholder_into(PLACEHOLDER_ID, FATHER_ID, relations)
+
+    assert rewritten == [
+        ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=GRANDFATHER_ID, child_id=FATHER_ID),
+        SpouseOf(a_id=FATHER_ID, b_id=MOTHER_ID),
+    ]
+
+
+def test_merge_placeholder_into_rejects_third_parent_for_real_parent() -> None:
+    """Двое своих родителей плюс родитель заглушки — третий родитель (SPEC 4.1, критерий 21).
+
+    Выбросить лишнее ребро на своё усмотрение функция не вправе: отказ, чтобы
+    вызывающий код сообщил пользователю, а не потерял связь тихо.
+    """
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=GRANDFATHER_ID, child_id=PLACEHOLDER_ID),
+        ParentOf(parent_id=MOTHER_ID, child_id=FATHER_ID),
+        ParentOf(parent_id=MARINA_ID, child_id=FATHER_ID),
+    ]
+
+    with pytest.raises(ValueError, match="больше 2 родителей"):
+        merge_placeholder_into(PLACEHOLDER_ID, FATHER_ID, relations)
+
+
+def test_merge_placeholder_into_does_not_duplicate_shared_parent() -> None:
+    """Общий родитель заглушки и настоящего родителя переносится один раз, без дубля ребра."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=GRANDFATHER_ID, child_id=PLACEHOLDER_ID),
+        ParentOf(parent_id=GRANDFATHER_ID, child_id=FATHER_ID),
+    ]
+
+    rewritten = merge_placeholder_into(PLACEHOLDER_ID, FATHER_ID, relations)
+
+    assert rewritten == [ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID)]
+
+
+def test_merge_placeholder_into_rejects_merging_into_own_parent() -> None:
+    """Слить заглушку в её собственного родителя — сделать его родителем самому себе."""
+    relations = [
+        ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
+        ParentOf(parent_id=FATHER_ID, child_id=PLACEHOLDER_ID),
+    ]
+
+    with pytest.raises(ValueError, match="родителем самому себе"):
+        merge_placeholder_into(PLACEHOLDER_ID, FATHER_ID, relations)
+
+
 def test_attach_parent_with_no_known_parents_creates_single_edge() -> None:
     result = attach_parent(
         ANTON_ID, FATHER_ID, relations=[], also_parent_of_siblings=None, people={}
@@ -210,11 +274,11 @@ def test_attach_parent_merges_placeholder_instead_of_asking_about_siblings() -> 
     )
 
     assert result.removed_placeholder_id == PLACEHOLDER_ID
-    assert sorted(result.removed, key=lambda e: e.child_id) == [
+    assert result.removed == [
         ParentOf(parent_id=PLACEHOLDER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=PLACEHOLDER_ID, child_id=MARINA_ID),
     ]
-    assert sorted(result.added, key=lambda e: e.child_id) == [
+    assert result.added == [
         ParentOf(parent_id=FATHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=FATHER_ID, child_id=MARINA_ID),
     ]
@@ -337,7 +401,7 @@ def test_attach_parent_answer_yes_propagates_to_existing_siblings() -> None:
         ANTON_ID, MOTHER_ID, relations, also_parent_of_siblings=True, people=people
     )
 
-    assert sorted(result.added, key=lambda e: e.child_id) == [
+    assert result.added == [
         ParentOf(parent_id=MOTHER_ID, child_id=ANTON_ID),
         ParentOf(parent_id=MOTHER_ID, child_id=MARINA_ID),
     ]

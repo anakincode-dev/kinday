@@ -81,7 +81,7 @@ in-memory реализации в тестах). `add_person` и `add_event` с�
 ## Этап 3b. Ядро: приглашения, редактирование, настройки (готово)
 
 `issue_invite`, `revoke_invite`, `accept_invite`, `delete_person`,
-`update_person`, `update_account_settings`, `set_override`,
+`update_person`, `update_account_settings`, `set_override`, `clear_override`,
 `set_current_family` поверх тех же портов, плюс `ReminderOverrideRepo`.
 
 Тесты закрывают критерии 22 (удаление человека с детьми превращает в

@@ -16,11 +16,12 @@ from datetime import UTC, date, datetime, time
 
 import pytest
 from tests.core.fakes import FixedClock
-from tests.scenario_repos import World
+from tests.scenario_repos import Snapshot, World
 from tests.scenarios import (
     accept_invite_in,
     add_event_to,
     add_person_to,
+    clear_override_in,
     create_family_for,
     delete_person_in,
     issue_invite_in,
@@ -30,8 +31,8 @@ from tests.scenarios import (
     update_person_in,
 )
 
-from kinday.core.models import EventKind, Gender, ParentOf
-from kinday.core.relations import RelationKind, SiblingsQuestionRequired
+from kinday.core.models import EventKind, Gender, ParentOf, SpouseOf
+from kinday.core.relations import RelationKind, SiblingsQuestionRequired, infer_relation_text
 from kinday.core.services import DEFAULT_OFFSETS_DAYS, NotFamilyOwner
 
 CLOCK = FixedClock(datetime(2027, 1, 1, tzinfo=UTC))
@@ -699,3 +700,223 @@ async def test_member_changes_own_settings_but_not_the_tree(world: World) -> Non
         (3,),
         time(8, 30),
     )
+
+
+@pytest.mark.asyncio
+async def test_deleted_father_keeps_grandparent_link_through_placeholder(world: World) -> None:
+    """SPEC 4.3: заглушка сохраняет связь вверх — внук не теряет деда вместе с отцом.
+
+    Заглушка существует ровно чтобы родство не терялось. Если при удалении
+    Петра снять его ребро к деду Ивану, Антон лишится «вашего дедушки»
+    (SPEC 4.2, глубина 2) — того самого родства, которое заглушка и должна
+    удержать.
+    """
+    family_id, owner_account_id, anton_id, petr_id = await _family_with_father(world)
+    ivan = await add_person_to(
+        world,
+        clock=CLOCK,
+        acting_account_id=owner_account_id,
+        family_id=family_id,
+        name="Иван",
+        birth_date=date(1955, 2, 20),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=petr_id,
+    )
+
+    await delete_person_in(
+        world, clock=CLOCK, acting_account_id=owner_account_id, person_id=petr_id
+    )
+
+    state = await world.snapshot(family_id)
+    placeholder = next(p for p in state.people if p.id == petr_id)
+    assert placeholder.is_placeholder is True
+    assert (ivan.id, petr_id) in {
+        (r.parent_id, r.child_id) for r in state.relations if isinstance(r, ParentOf)
+    }
+    people = {p.id: p for p in state.people}
+    assert infer_relation_text(anton_id, ivan.id, people, state.relations) == "ваш дедушка"
+
+
+@pytest.mark.asyncio
+async def test_merged_placeholder_hands_over_spouse_and_parent(world: World) -> None:
+    """SPEC 4.1: настоящий родитель получает все рёбра заглушки, а не только рёбра к детям."""
+    family_id, owner_account_id, anton_id, petr_id = await _family_with_father(world)
+    ivan = await add_person_to(
+        world,
+        clock=CLOCK,
+        acting_account_id=owner_account_id,
+        family_id=family_id,
+        name="Иван",
+        birth_date=date(1955, 2, 20),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=petr_id,
+    )
+    olga = await add_person_to(
+        world,
+        clock=CLOCK,
+        acting_account_id=owner_account_id,
+        family_id=family_id,
+        name="Ольга",
+        gender=Gender.FEMALE,
+        birth_date=date(1982, 8, 8),
+        relation_kind=RelationKind.WIFE,
+        relative_to_person_id=petr_id,
+    )
+    # Пётр становится заглушкой и сохраняет отца Ивана и супругу Ольгу.
+    await delete_person_in(
+        world, clock=CLOCK, acting_account_id=owner_account_id, person_id=petr_id
+    )
+
+    sergey = await add_person_to(
+        world,
+        clock=CLOCK,
+        acting_account_id=owner_account_id,
+        family_id=family_id,
+        name="Сергей",
+        birth_date=date(1979, 4, 4),
+        relation_kind=RelationKind.FATHER,
+        relative_to_person_id=anton_id,
+    )
+
+    state = await world.snapshot(family_id)
+    assert [p for p in state.people if p.is_placeholder] == []
+    assert {p.id for p in state.people} == {anton_id, ivan.id, olga.id, sergey.id}
+    assert {(r.parent_id, r.child_id) for r in state.relations if isinstance(r, ParentOf)} == {
+        (sergey.id, anton_id),
+        (ivan.id, sergey.id),
+    }
+    assert {frozenset((r.a_id, r.b_id)) for r in state.relations if isinstance(r, SpouseOf)} == {
+        frozenset((sergey.id, olga.id))
+    }
+    people = {p.id: p for p in state.people}
+    assert infer_relation_text(anton_id, ivan.id, people, state.relations) == "ваш дедушка"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_is_not_offered_as_a_relative(world: World) -> None:
+    """SPEC 4.1: заглушку не выбрать родственником нового человека.
+
+    Заглушка не показывается в списках, поэтому в боте её и не выбрать, но без
+    проверки в ядре запрос всё равно прошёл бы. Связь «относительно заглушки»
+    пользователь и не имел в виду: у неё нет ни имени, ни пола, ни даты
+    рождения, так что осознанно указать её нельзя. Законный путь — добавить
+    родителя тому, кто на заглушке висит, и заглушка сольётся с ним.
+    """
+    family = await create_family_for(
+        world, clock=CLOCK, telegram_user_id=100, name="Антон", birth_date=ANTON_BIRTH
+    )
+    [anton] = await world.person.list_by_family(family.id)
+    [membership] = await world.membership.list_by_family(family.id)
+    await add_person_to(
+        world,
+        clock=CLOCK,
+        acting_account_id=membership.account_id,
+        family_id=family.id,
+        name="Марина",
+        gender=Gender.FEMALE,
+        birth_date=MARINA_BIRTH,
+        relation_kind=RelationKind.SISTER,
+        relative_to_person_id=anton.id,
+    )
+    state = await world.snapshot(family.id)
+    [placeholder] = [p for p in state.people if p.is_placeholder]
+
+    for relation_kind in (
+        RelationKind.HUSBAND,
+        RelationKind.BROTHER,
+        RelationKind.FATHER,
+        RelationKind.SON,
+    ):
+        with pytest.raises(ValueError, match="заглушка"):
+            await add_person_to(
+                world,
+                clock=CLOCK,
+                acting_account_id=membership.account_id,
+                family_id=family.id,
+                name="Никто",
+                birth_date=date(1960, 5, 5),
+                relation_kind=relation_kind,
+                relative_to_person_id=placeholder.id,
+            )
+
+    assert await world.snapshot(family.id) == state
+
+
+@pytest.mark.asyncio
+async def test_cleared_override_returns_reminders_to_account_settings(world: World) -> None:
+    """SPEC 5.6: снятое переопределение — повод пересчитать, напоминания возвращаются к аккаунту.
+
+    Сравниваются и смещения, и `due_at_utc`: SPEC 3.4 переопределяет смещения и
+    время суток вместе, поэтому вернуться должны обе половины пары. Сравнение
+    идёт с состоянием до переопределения, без id — строки пересозданы заново.
+    """
+
+    def birthday_reminders(state: Snapshot, event_id: int) -> set[tuple[int, date, datetime]]:
+        return {
+            (r.offset_days, r.occurrence_date, r.due_at_utc)
+            for r in state.reminders
+            if r.event_id == event_id
+        }
+
+    family_id, owner_account_id, _, petr_id = await _family_with_father(world)
+    before = await world.snapshot(family_id)
+    [petr_birthday] = [e for e in before.events if e.person_id == petr_id]
+    await set_override_in(
+        world,
+        clock=CLOCK,
+        account_id=owner_account_id,
+        event_id=petr_birthday.id,
+        offsets_days=(2,),
+        time_of_day=time(20, 0),
+    )
+    overridden = await world.snapshot(family_id)
+    assert birthday_reminders(overridden, petr_birthday.id) != birthday_reminders(
+        before, petr_birthday.id
+    )
+
+    await clear_override_in(
+        world, clock=CLOCK, account_id=owner_account_id, event_id=petr_birthday.id
+    )
+
+    assert await world.override.get(owner_account_id, petr_birthday.id) is None
+    after = await world.snapshot(family_id)
+    assert birthday_reminders(after, petr_birthday.id) == birthday_reminders(
+        before, petr_birthday.id
+    )
+    assert {r.offset_days for r in after.reminders} == set(DEFAULT_OFFSETS_DAYS)
+
+
+@pytest.mark.asyncio
+async def test_clearing_absent_override_changes_nothing(world: World) -> None:
+    """Снятие того, чего нет, — не ошибка: повторное «сбросить» не должно падать."""
+    family_id, owner_account_id, _, petr_id = await _family_with_father(world)
+    state = await world.snapshot(family_id)
+    [petr_birthday] = [e for e in state.events if e.person_id == petr_id]
+
+    await clear_override_in(
+        world, clock=CLOCK, account_id=owner_account_id, event_id=petr_birthday.id
+    )
+
+    assert await world.snapshot(family_id) == state
+
+
+@pytest.mark.asyncio
+async def test_outsider_cannot_clear_override(world: World) -> None:
+    """Снимать переопределение, как и ставить, может только участник семьи события (SPEC 2)."""
+    family_id, _, _, petr_id = await _family_with_father(world)
+    state = await world.snapshot(family_id)
+    [petr_birthday] = [e for e in state.events if e.person_id == petr_id]
+    outsider = await create_family_for(
+        world, clock=CLOCK, telegram_user_id=900, name="Посторонний", birth_date=date(1970, 1, 1)
+    )
+    [outsider_membership] = await world.membership.list_by_family(outsider.id)
+
+    with pytest.raises(ValueError, match="не состоит"):
+        await clear_override_in(
+            world,
+            clock=CLOCK,
+            account_id=outsider_membership.account_id,
+            event_id=petr_birthday.id,
+        )
+
+    assert await world.snapshot(family_id) == state

@@ -18,6 +18,7 @@ from kinday.core.services import (
     accept_invite,
     add_event,
     add_person,
+    clear_override,
     create_family,
     delete_person,
     issue_invite,
@@ -256,6 +257,20 @@ async def set_override_in(
         event_id,
         offsets_days,
         time_of_day,
+        world.override,
+        world.event,
+        world.account,
+        world.membership,
+        world.reminder,
+        clock,
+        world.uow,
+    )
+
+
+async def clear_override_in(world: World, *, clock: Clock, account_id: int, event_id: int) -> None:
+    await clear_override(
+        account_id,
+        event_id,
         world.override,
         world.event,
         world.account,

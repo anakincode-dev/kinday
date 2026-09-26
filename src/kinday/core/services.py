@@ -27,6 +27,7 @@ from kinday.core.models import (
     Membership,
     ParentOf,
     Person,
+    Relation,
     Reminder,
     ReminderOverride,
     SpouseOf,
@@ -66,6 +67,23 @@ INVITE_TTL = timedelta(days=7)
 # не бросит исключение, прежде чем создавать нового человека в хранилище —
 # см. комментарий в add_person.
 _DRY_RUN_PERSON_ID = -1
+
+
+def _with_real_id(relation: Relation, person_id: int) -> Relation:
+    """Подставляет настоящий id вместо _DRY_RUN_PERSON_ID в посчитанное «вхолостую» ребро.
+
+    Новый родитель встаёт на место заглушки, а она держит рёбра в любую
+    сторону: к детям (parent_id), к своим родителям (child_id) и к супругу
+    (merge_placeholder_into всегда кладёт нового родителя первым концом).
+    Поэтому подстановка смотрит все поля, а не только parent_id.
+    """
+    if isinstance(relation, ParentOf):
+        if relation.parent_id == _DRY_RUN_PERSON_ID:
+            return ParentOf(parent_id=person_id, child_id=relation.child_id)
+        assert relation.child_id == _DRY_RUN_PERSON_ID
+        return ParentOf(parent_id=relation.parent_id, child_id=person_id)
+    assert relation.a_id == _DRY_RUN_PERSON_ID
+    return SpouseOf(a_id=person_id, b_id=relation.b_id)
 
 
 class NotFamilyOwner(Exception):
@@ -289,6 +307,14 @@ async def add_person(
     relative_to_person_id не принадлежит family_id — иначе рёбра могли бы
     связать между собой людей из разных семей (SPEC 2: семьи не видят данные
     друг друга).
+
+    Отклоняет и заглушку в роли relative_to_person_id. Она не показывается в
+    списках (SPEC 4.1), поэтому в боте её и не выбрать, а здесь проверяется
+    потому, что записать связь «относительно заглушки» пользователь и не имел
+    в виду: у неё нет ни имени, ни пола, ни даты рождения, так что выбрать её
+    осознанно нельзя. Законный способ завести человека на её месте — добавить
+    родителя тому, кто на заглушке висит (FATHER/MOTHER для ребёнка), тогда
+    заглушка сливается с ним вместе со всеми своими рёбрами.
     """
     async with uow:
         await _require_owner(family_repo, family_id, acting_account_id)
@@ -298,6 +324,11 @@ async def add_person(
         people = {p.id: p for p in await person_repo.list_by_family(family_id)}
         if relative_to_person_id not in people:
             raise ValueError(f"Человек {relative_to_person_id} не найден в семье {family_id}")
+        if people[relative_to_person_id].is_placeholder:
+            raise ValueError(
+                f"Запись {relative_to_person_id} — заглушка неизвестного родителя, "
+                "родственником её выбрать нельзя"
+            )
 
         match relation_kind:
             case RelationKind.FATHER | RelationKind.MOTHER:
@@ -312,7 +343,7 @@ async def add_person(
                 change = attach_parent(
                     relative_to_person_id,
                     _DRY_RUN_PERSON_ID,
-                    parent_relations,
+                    all_relations,
                     also_parent_of_siblings,
                     people,
                 )
@@ -324,10 +355,7 @@ async def add_person(
                 if change.removed_placeholder_id is not None:
                     await person_repo.delete(change.removed_placeholder_id)
                 for edge in change.added:
-                    assert edge.parent_id == _DRY_RUN_PERSON_ID
-                    await relation_repo.add(
-                        family_id, ParentOf(parent_id=new_person.id, child_id=edge.child_id)
-                    )
+                    await relation_repo.add(family_id, _with_real_id(edge, new_person.id))
 
             case RelationKind.SON | RelationKind.DAUGHTER:
                 new_person = await person_repo.create(
@@ -500,14 +528,17 @@ async def delete_person(
     """Удаляет человека физически, либо, если у него есть дети, превращает
 
     его в заглушку: имя, пол, дата рождения и привязка аккаунта стираются,
-    события и напоминания удаляются, рёбра к детям остаются (SPEC 4.3,
-    критерий приёмки 22). Рёбра, где person_id сам ребёнок (к своим родителям)
-    или супруг, удаляются в обоих случаях — SPEC называет заглушкой узел без
-    имени, пола и даты рождения, несущий рёбра только к детям (см.
-    create_placeholder_parent), поэтому у заглушки не может остаться ни
-    родителей, ни супруга. Заглушка-родитель, у которой после удаления не
-    осталось ни одного ребёнка, удаляется вместе с ним
-    (_drop_childless_placeholders).
+    события и напоминания удаляются, а рёбра остаются все (SPEC 4.3, критерий
+    приёмки 22) — и к детям, и к его родителям, и к супругу. Заглушка живёт
+    ровно для того, чтобы родство не рвалось: сними её ребро к отцу, и внук
+    потеряет деда (SPEC 4.2 — родство выводится обходом графа глубиной до
+    трёх). Когда на её место встанет настоящий родитель, merge_placeholder_into
+    перенесёт ему все эти рёбра.
+
+    Человек без детей удаляется физически, вместе со всеми своими рёбрами.
+    Заглушка-родитель, у которой после этого не осталось ни одного ребёнка,
+    удаляется вслед за ним (_drop_childless_placeholders): без детей она не
+    несёт смысла.
 
     Вместе с записью отзываются все выданные на неё неиспользованные
     приглашения (SPEC 3.2: приглашение привязано к конкретной записи): иначе
@@ -554,6 +585,15 @@ async def delete_person(
 
         relations = await relation_repo.list_by_family(person.family_id)
         has_children = any(isinstance(r, ParentOf) and r.parent_id == person_id for r in relations)
+
+        if has_children:
+            person.name = None
+            person.gender = None
+            person.birth_date = None
+            person.is_placeholder = True
+            await person_repo.update(person)
+            return
+
         parent_ids = {
             r.parent_id for r in relations if isinstance(r, ParentOf) and r.child_id == person_id
         }
@@ -562,16 +602,7 @@ async def delete_person(
                 isinstance(relation, SpouseOf) and person_id in (relation.a_id, relation.b_id)
             ):
                 await relation_repo.remove(person.family_id, relation)
-
-        if has_children:
-            person.name = None
-            person.gender = None
-            person.birth_date = None
-            person.is_placeholder = True
-            await person_repo.update(person)
-        else:
-            await person_repo.delete(person_id)
-
+        await person_repo.delete(person_id)
         await _drop_childless_placeholders(parent_ids, person.family_id, person_repo, relation_repo)
 
 
@@ -609,17 +640,15 @@ async def _drop_childless_placeholders(
     Заглушка нужна только чтобы связать братьев и сестёр между собой (SPEC 4.1);
     без детей она не несёт смысла, а показать её пользователю нельзя.
 
-    Перед удалением снимаются все рёбра заглушки, а не только рёбра к детям.
-    Рассчитывать на то, что у заглушки есть лишь рёбра вниз, нельзя: так она
-    только создаётся (create_placeholder_parent), но `add_person` не запрещает
-    выбрать заглушку как `relative_to_person_id`, поэтому у неё может
-    появиться супруг, а добавленный ей брат заведёт над ней вторую заглушку.
-    Висячее ребро на удалённого человека в SQLite при `PRAGMA foreign_keys=ON`
-    (SPEC 6.2) либо не даст удалить строку, либо утащит каскадом чужие рёбра.
+    Перед удалением снимаются все рёбра заглушки, а не только рёбра к детям:
+    у заглушки, в которую превратился человек с детьми (SPEC 4.3), законно
+    есть и свои родители, и супруг. Оставить их висеть нельзя — в SQLite при
+    `PRAGMA foreign_keys=ON` (SPEC 6.2) висячее ребро либо не даст удалить
+    строку, либо утащит каскадом чужие рёбра.
 
-    Поэтому и обход идёт вверх по цепочке: снятое ребро могло быть последним
-    ребёнком заглушки этажом выше. `candidate_ids` перебирается как очередь,
-    каждый узел рассматривается один раз.
+    Обход идёт вверх по цепочке по той же причине: снятое ребро могло быть
+    последним ребёнком заглушки этажом выше. `candidate_ids` перебирается как
+    очередь, каждый узел рассматривается один раз.
     """
     queue = set(candidate_ids)
     deleted: set[int] = set()
@@ -996,6 +1025,51 @@ async def set_override(
         )
 
         return override
+
+
+async def clear_override(
+    account_id: int,
+    event_id: int,
+    override_repo: ReminderOverrideRepo,
+    event_repo: EventRepo,
+    account_repo: AccountRepo,
+    membership_repo: MembershipRepo,
+    reminder_repo: ReminderRepo,
+    clock: Clock,
+    uow: UnitOfWork,
+) -> None:
+    """Снимает переопределение пары «аккаунт и событие» и возвращает будущие
+    напоминания к общим настройкам аккаунта.
+
+    SPEC 5.6 называет снятие переопределения поводом для пересчёта наравне с
+    его добавлением: без пересчёта будущие pending-строки остались бы стоять по
+    снятым смещениям и времени суток, то есть снятие не применилось бы до
+    следующей правки.
+
+    Как и set_override, отклоняет аккаунт без Membership в семье события:
+    переопределение есть только у участника, постороннему снимать нечего.
+
+    Снятие отсутствующего переопределения ошибкой не считается: пользователь
+    видит в боте одну кнопку «вернуть общие настройки», и её повторное нажатие
+    (или нажатие, когда переопределения и не было) должно быть безобидным.
+    Но и пересчёта в этом случае не происходит: повод из SPEC 5.6 — снятое
+    переопределение, а снимать было нечего. Иначе пересчёт впустую удалил бы и
+    заново вставил те же будущие строки, сменив им id на ровном месте.
+    """
+    async with uow:
+        event = await event_repo.get(event_id)
+        membership = await membership_repo.get_by_account_and_family(account_id, event.family_id)
+        if membership is None:
+            raise ValueError(f"Аккаунт {account_id} не состоит в семье {event.family_id}")
+
+        if await override_repo.get(account_id, event_id) is None:
+            return
+        await override_repo.revoke(account_id, event_id)
+
+        account = await account_repo.get(account_id)
+        await _rematerialize_event_for_person(
+            event, membership, account, override_repo, reminder_repo, clock
+        )
 
 
 async def set_current_family(
