@@ -11,6 +11,7 @@ from kinday.core.ports import (
     MembershipRepo,
     ReminderOverrideRepo,
     ReminderRepo,
+    UnitOfWork,
 )
 from kinday.core.reminders import apply_override, materialize_for_event
 
@@ -24,6 +25,7 @@ async def run_daily_materialization(
     membership_repo: MembershipRepo,
     override_repo: ReminderOverrideRepo,
     reminder_repo: ReminderRepo,
+    unit_of_work: UnitOfWork,
 ) -> None:
     """Достраивает напоминания для всех событий и всех людей с аккаунтами.
 
@@ -34,9 +36,11 @@ async def run_daily_materialization(
     что повторный запуск ничего не меняет, а уже отправленную строку
     материализация не воскрешает.
 
-    Поэтому и UnitOfWork не нужен: задание не делает половинчатых изменений —
-    каждая вставка самостоятельна и идемпотентна, а прерванный на середине
-    прогон досчитает следующий.
+    Запись идёт тем же путём, что и в сценариях ядра: через UnitOfWork, но своей
+    короткой транзакцией на каждое событие, а не одной на весь прогон. Событий в
+    базе сколько угодно, и общая транзакция держала бы замок записи всё время
+    прохода, мешая диалогам бота и тику. Прерванный на середине прогон не портит
+    состояние: вставки идемпотентны, недостроенное досчитает следующий запуск.
 
     Переопределения по событию (SPEC 5.6) применяются так же, как в сценариях
     ядра: смещения и время суток берутся из ReminderOverride, если он есть,
@@ -54,6 +58,7 @@ async def run_daily_materialization(
                 )
             )
         if reminders:
-            await reminder_repo.add_many(reminders)
+            async with unit_of_work:
+                await reminder_repo.add_many(reminders)
             added += len(reminders)
     logger.info("Суточная материализация: построено не больше %s напоминаний", added)

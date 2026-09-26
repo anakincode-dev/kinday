@@ -636,9 +636,12 @@ class SqliteReminderRepo:
         """Забирает наступившие напоминания, переводя каждое из pending в sending.
 
         SPEC 5.5: строку получает только тот, кто увидел её в состоянии pending,
-        поэтому статус меняется условным UPDATE и каждое изменение фиксируется
-        сразу (соединение в автокоммите). Строка, которую между выборкой и
-        UPDATE успел забрать кто-то другой, в результат не попадает.
+        поэтому статус меняется условным UPDATE — строка, которую между выборкой
+        и UPDATE успел забрать кто-то другой, в результат не попадает.
+
+        Захват — первый из трёх шагов тика, и вызывается он внутри своей
+        короткой единицы работы (scheduler/tick.py): фиксация происходит на
+        выходе из неё, до сетевого вызова, а не по каждому запросу.
         """
         moment = dump_datetime(at)
 
@@ -790,6 +793,34 @@ class SqliteReminderRepo:
         await self._database.run(
             lambda c: c.execute("DELETE FROM reminders WHERE person_id = ?", (person_id,))
         )
+
+    async def delete_future_failed_for_person(self, person_id: int, after: datetime) -> None:
+        """Обратный путь к 403: без удаления уникальный индекс не даст построить их заново."""
+        await self._database.run(
+            lambda c: c.execute(
+                """
+                DELETE FROM reminders
+                 WHERE person_id = ? AND status = 'failed' AND due_at_utc >= ?
+                """,
+                (person_id, dump_datetime(after)),
+            )
+        )
+
+    async def fail_pending_for_person(self, person_id: int, at: datetime) -> int:
+        """SPEC 5.5: после 403 оставшиеся pending получателя закрываются, а не ждут тика."""
+
+        def work(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
+                """
+                UPDATE reminders
+                   SET status = 'failed', status_changed_at = ?
+                 WHERE person_id = ? AND status = 'pending'
+                """,
+                (dump_datetime(at), person_id),
+            )
+            return cursor.rowcount
+
+        return await self._database.run(work)
 
     async def fail_all_sending(self, at: datetime) -> int:
         """SPEC 5.5: строки, застрявшие в sending после падения, повторно не отправляются."""

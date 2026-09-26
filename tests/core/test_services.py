@@ -28,6 +28,7 @@ from kinday.core.relations import RelationKind, SiblingsQuestionRequired
 from kinday.core.services import (
     DEFAULT_OFFSETS_DAYS,
     NotFamilyOwner,
+    _with_real_id,
     add_event,
     add_person,
     create_family,
@@ -878,3 +879,15 @@ async def test_account_in_two_families_gets_reminders_from_both() -> None:
         anton_in_family2.id in recipient_person_ids
     )  # тот же account, что и anton1, во второй семье
     assert len(repos.reminder.reminders) == 3 * len(DEFAULT_OFFSETS_DAYS)
+
+
+def test_with_real_id_rejects_edge_without_placeholder_end() -> None:
+    """Ребро без заглушечного конца — ошибка расчёта, и она видна даже под python -O.
+
+    Раньше здесь стоял assert, а он выключается оптимизацией: в хранилище ушло
+    бы ребро с id -1, то есть человек, которого нет.
+    """
+    with pytest.raises(RuntimeError):
+        _with_real_id(ParentOf(parent_id=5, child_id=6), 9)
+    with pytest.raises(RuntimeError):
+        _with_real_id(SpouseOf(a_id=5, b_id=6), 9)
