@@ -61,6 +61,7 @@ async def _create_family(repos: Repos, *, telegram_user_id: int, name: str, birt
         repos.event,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -93,6 +94,7 @@ async def _add_person(
         repos.membership,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -109,6 +111,7 @@ async def _delete_person(repos: Repos, *, acting_account_id: int, person_id: int
         repos.invite,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -135,6 +138,7 @@ async def _update_person(
         repos.override,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -157,6 +161,7 @@ async def _update_account_settings(
         repos.override,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -179,6 +184,7 @@ async def _set_override(
         repos.membership,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -191,6 +197,7 @@ async def _issue_invite(repos: Repos, *, acting_account_id: int, person_id: int)
         repos.membership,
         repos.invite,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -209,6 +216,7 @@ async def _accept_invite(
         repos.override,
         repos.reminder,
         CLOCK,
+        repos.uow,
     )
 
 
@@ -1015,7 +1023,7 @@ async def test_accept_invite_rejects_revoked_code() -> None:
         relative_to_person_id=owner_person.id,
     )
     invite = await _issue_invite(repos, acting_account_id=owner_account.id, person_id=sister.id)
-    await revoke_invite(owner_account.id, invite.id, repos.family, repos.invite, CLOCK)
+    await revoke_invite(owner_account.id, invite.id, repos.family, repos.invite, CLOCK, repos.uow)
 
     with pytest.raises(ValueError):
         await _accept_invite(repos, code=invite.code, telegram_user_id=222)
@@ -1056,6 +1064,7 @@ async def test_accept_invite_rejects_expired_code() -> None:
             repos.override,
             repos.reminder,
             late_clock,
+            repos.uow,
         )
 
 
@@ -1137,7 +1146,9 @@ async def test_revoke_invite_rejects_non_owner() -> None:
     )
 
     with pytest.raises(NotFamilyOwner):
-        await revoke_invite(intruder_account.id, invite.id, repos.family, repos.invite, CLOCK)
+        await revoke_invite(
+            intruder_account.id, invite.id, repos.family, repos.invite, CLOCK, repos.uow
+        )
 
 
 @pytest.mark.asyncio
@@ -1671,10 +1682,12 @@ async def test_set_current_family_rejects_family_without_membership() -> None:
     [anton_account] = [a for a in repos.account.accounts.values() if a.telegram_user_id == 111]
 
     with pytest.raises(ValueError):
-        await set_current_family(anton_account.id, family2.id, repos.account, repos.membership)
+        await set_current_family(
+            anton_account.id, family2.id, repos.account, repos.membership, repos.uow
+        )
 
     updated = await set_current_family(
-        anton_account.id, family1.id, repos.account, repos.membership
+        anton_account.id, family1.id, repos.account, repos.membership, repos.uow
     )
     assert updated.current_family_id == family1.id
 

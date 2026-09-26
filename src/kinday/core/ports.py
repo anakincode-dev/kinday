@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import TracebackType
 from typing import Protocol
 
 from kinday.core.models import (
@@ -38,6 +39,34 @@ class Clock(Protocol):
 class Notifier(Protocol):
     async def send(self, chat_id: int, text: str) -> None:
         """Поднимает RecipientBlocked при 403 и TransportError при сетевом сбое."""
+        ...
+
+
+class UnitOfWork(Protocol):
+    """Одна транзакция хранилища на сценарий.
+
+    Сценарий из services.py пишет в несколько таблиц сразу — человек, рёбра,
+    событие, напоминания, — и половинчатый результат недопустим: человек без
+    рёбер потерял бы родство, событие без напоминаний молчало бы до суточного
+    задания. Поэтому каждый сценарий целиком выполняется внутри
+    `async with unit_of_work:`: выход без исключения фиксирует изменения,
+    выход с исключением откатывает их.
+
+    Ядро не знает, чем транзакция обеспечена: у SQLite это BEGIN/COMMIT на
+    соединении, у in-memory реализации в тестах — ничего (фейки не рвутся на
+    середине). Вложенных транзакций протокол не обещает: сценарии друг друга
+    не вызывают.
+    """
+
+    async def __aenter__(self) -> UnitOfWork: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Возвращает None: исключение сценария наружу не глушится."""
         ...
 
 
@@ -88,8 +117,12 @@ class ReminderRepo(Protocol):
         """
         ...
 
-    async def fail_all_sending(self) -> None:
-        """При старте сервиса переводит все строки sending в failed (SPEC 5.5)."""
+    async def fail_all_sending(self, at: datetime) -> None:
+        """При старте сервиса переводит все строки sending в failed (SPEC 5.5).
+
+        `at` — момент перехода, как у mark_failed: строки остались от прошлого
+        запуска, и когда именно их закрыли, из самих строк иначе не узнать.
+        """
         ...
 
 

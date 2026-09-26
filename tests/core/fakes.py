@@ -3,12 +3,22 @@
 Общие для тестов разных сценариев (см. PLAN.md, этапы 3a/3b): каждый тестовый
 модуль собирает нужный ему набор через `build_repos()` и передаёт репозитории
 напрямую в функции `core/services.py`.
+
+Фейки воспроизводят только уникальный индекс напоминаний (SPEC 5.3) — он влияет
+на сам сценарий материализации. Остальных ограничений схемы, включая каскады по
+внешним ключам, здесь нет: физически удалённый человек уносит в SQLite свои
+приглашения и рёбра, а в фейке они остаются висеть. Поэтому тест не должен
+опираться на состояние записей, привязанных к удалённому человеку — сравнивать
+поведение двух бэкендов имеет смысл только там, где сама запись уцелела
+(например, превратилась в заглушку). Общие сценарные тесты живут в
+tests/storage/test_scenarios.py и проходят на обоих бэкендах.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from types import TracebackType
 
 from kinday.core.models import (
     Account,
@@ -253,7 +263,7 @@ class FakeReminderRepo:
     async def delete_all_for_person(self, person_id: int) -> None:
         self.reminders = [r for r in self.reminders if r.person_id != person_id]
 
-    async def fail_all_sending(self) -> None:
+    async def fail_all_sending(self, at: datetime) -> None:
         raise NotImplementedError
 
 
@@ -298,6 +308,26 @@ class FakeReminderOverrideRepo:
         self.overrides.pop((account_id, event_id), None)
 
 
+class FakeUnitOfWork:
+    """Единица работы без транзакции: фейки не рвутся на середине записи.
+
+    Сценарию нужен объект, поддерживающий `async with`, и ничего больше:
+    проверку самого откатa ведут тесты на SQLite (tests/storage), где
+    транзакция настоящая.
+    """
+
+    async def __aenter__(self) -> FakeUnitOfWork:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
 @dataclass
 class Repos:
     family: FakeFamilyRepo
@@ -309,6 +339,7 @@ class Repos:
     reminder: FakeReminderRepo
     invite: FakeInviteRepo
     override: FakeReminderOverrideRepo
+    uow: FakeUnitOfWork
 
 
 def build_repos() -> Repos:
@@ -322,4 +353,5 @@ def build_repos() -> Repos:
         reminder=FakeReminderRepo(),
         invite=FakeInviteRepo(),
         override=FakeReminderOverrideRepo(),
+        uow=FakeUnitOfWork(),
     )
