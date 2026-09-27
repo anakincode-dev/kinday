@@ -2,7 +2,9 @@
 
 Telegram-бот семейных напоминаний: хранит генеалогическое дерево вместе с
 важными датами и заранее напоминает о них каждому родственнику в личном чате.
-Полная спецификация — [SPEC.md](SPEC.md).
+
+- **Для пользователей:** [USERGUIDE.md](USERGUIDE.md) — как пользоваться ботом
+- **Полная спецификация:** [SPEC.md](SPEC.md)
 
 ## Установка на сервере
 
@@ -54,6 +56,10 @@ Telegram-бот семейных напоминаний: хранит генеа
 ## Обновление
 
 ```bash
+# Обновить исходный репозиторий до main
+cd /workspace/femevmen && git pull --ff-only
+
+# Обновить боевую копию и перезапустить сервис
 cd /opt/kinday
 sudo git pull --ff-only
 UV_LINK_MODE=copy /root/.local/bin/uv sync --frozen --no-dev --python /usr/bin/python3.12
