@@ -8,6 +8,7 @@ Type=simple
 User=kinday
 Group=kinday
 WorkingDirectory=/opt/kinday
+ExecStartPre=/bin/bash -c 'curl -sS "https://api.telegram.org/bot$BOT_TOKEN/getMe" | grep -q "\"ok\":true" || { echo "Invalid BOT_TOKEN"; exit 1; }'
 ExecStart=/opt/kinday/.venv/bin/python -m kinday
 EnvironmentFile=/etc/kinday/token.env
 Restart=on-failure
@@ -24,7 +25,6 @@ PrivateTmp=yes
 
 # Разрешаем только нужные каталоги
 ReadWritePaths=/var/lib/kinday
-ReadWritePaths=/var/log/kinday
 
 [Install]
 WantedBy=multi-user.target
