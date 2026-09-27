@@ -203,10 +203,16 @@ in-memory реализаций (общие фикстуры, разные реп
 от диалогов через настоящий `Dispatcher`, то есть ценой самого ценного в
 сквозном тесте, поэтому бюджет этапа меряется по `--durations`.
 
-## Этап 8. Инфраструктура запуска
+## Этап 8. Инфраструктура запуска (готово)
 
-Systemd-юнит, systemd-таймер бэкапа (`sqlite3 .backup`, хранение 14 копий),
+Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`, хранение 14 копий),
 раздел README про восстановление из бэкапа.
 
 Готово: развёртывание на сервере по README в три команды из этапа 0 плюс
 установка юнитов.
+
+- `deploy/kinday.service`: сервис с защитой (NoNewPrivileges, ProtectSystem=strict,
+  ProtectHome, PrivateTmp, ReadWritePaths)
+- `deploy/kinday-backup.service` + `.timer`: ежедневный бэкап
+- `src/kinday/backup/`: модуль `BackupManager` с ротацией 14 копий
+- `tests/infratest/`: 21 тест для systemd и backup
