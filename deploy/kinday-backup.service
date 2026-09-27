@@ -1,0 +1,14 @@
+[Unit]
+Description=Kinday - ежедневный бэкап базы данных
+Documentation=https://github.com/anakincode-dev/kinday
+
+[Service]
+Type=oneshot
+User=kinday
+Group=kinday
+WorkingDirectory=/opt/kinday
+ExecStart=/opt/kinday/.venv/bin/python -m kinday.backup
+EnvironmentFile=/etc/kinday/token.env
+
+[Install]
+WantedBy=timers.target

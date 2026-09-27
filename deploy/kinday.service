@@ -1,0 +1,30 @@
+[Unit]
+Description=Kinday - Telegram bot для семейных напоминаний
+Documentation=https://github.com/anakincode-dev/kinday
+After=network.target
+
+[Service]
+Type=simple
+User=kinday
+Group=kinday
+WorkingDirectory=/opt/kinday
+ExecStart=/opt/kinday/.venv/bin/python -m kinday
+EnvironmentFile=/etc/kinday/token.env
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+TimeoutStartSec=30
+
+# Защита системы
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Разрешаем только нужные каталоги
+ReadWritePaths=/var/lib/kinday
+ReadWritePaths=/var/log/kinday
+
+[Install]
+WantedBy=multi-user.target
