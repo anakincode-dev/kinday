@@ -1,8 +1,8 @@
-"""Точка входа: собирает зависимости и поднимает бота с планировщиком.
+"""Точка входа: читает настройки, открывает базу и поднимает собранное приложение.
 
-Единственное место, где сходятся все слои: конфигурация из окружения, соединение
-с SQLite и миграции, порты ядра на репозиториях, notifier поверх aiogram,
-планировщик с двумя заданиями и длинный опрос.
+Сама проводка слоёв живёт в `kinday.app`: её делят боевой запуск и сквозной
+тест (SPEC 9). Здесь остаётся то, что есть только в бою, — конфигурация из
+окружения, файл базы с миграциями, настоящий `Bot` и длинный опрос.
 """
 
 from __future__ import annotations
@@ -11,15 +11,12 @@ import asyncio
 import logging
 from pathlib import Path
 
+from kinday.app import build_application, start_application, stop_application
 from kinday.clock import SystemClock
 from kinday.config import Settings
 from kinday.core.ports import Clock
-from kinday.scheduler.materialize import run_daily_materialization
-from kinday.scheduler.setup import build_scheduler, start_scheduler
-from kinday.scheduler.tick import run_tick
 from kinday.storage.db import Database, apply_migrations, connect
-from kinday.telegram.bot import build_bot, build_deps, build_dispatcher, run_polling
-from kinday.telegram.notifier import TelegramNotifier
+from kinday.telegram.bot import build_bot, run_polling
 
 logger = logging.getLogger(__name__)
 
@@ -48,46 +45,17 @@ async def _run(settings: Settings) -> None:
     database = Database(connection)
 
     clock: Clock = SystemClock()
-    deps = build_deps(database, clock)
     bot = build_bot(settings)
-    dispatcher = build_dispatcher(deps)
-    notifier = TelegramNotifier(bot)
+    app = build_application(database, bot, clock)
 
-    async def tick() -> None:
-        await run_tick(
-            clock,
-            notifier,
-            deps.account,
-            deps.event,
-            deps.membership,
-            deps.person,
-            deps.relation,
-            deps.reminder,
-            deps.uow,
-        )
-
-    async def materialize() -> None:
-        await run_daily_materialization(
-            clock,
-            deps.account,
-            deps.event,
-            deps.membership,
-            deps.override,
-            deps.reminder,
-            deps.uow,
-        )
-
-    scheduler = build_scheduler(tick, materialize)
-    # Только через start_scheduler: он закрывает строки, застрявшие в sending,
+    # Только через start_application: он закрывает строки, застрявшие в sending,
     # и лишь потом пускает задания (SPEC 5.5, критерий приёмки 9).
-    await start_scheduler(scheduler, clock, deps.reminder)
+    await start_application(app)
     logger.info("kinday запущен, база %s", database_path)
     try:
-        await run_polling(bot, dispatcher)
+        await run_polling(bot, app.dispatcher)
     finally:
-        scheduler.shutdown(wait=False)
-        await bot.session.close()
-        database.close()
+        await stop_application(app)
         logger.info("kinday остановлен")
 
 
