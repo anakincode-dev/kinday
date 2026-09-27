@@ -22,6 +22,7 @@ from aiogram.methods import GetMe, GetUpdates, TelegramMethod
 from aiogram.types import User
 
 from kinday import __main__ as entry_point
+from kinday import app as composition_root
 from kinday.config import ConfigError
 from kinday.core.models import ReminderStatus
 from kinday.scheduler.setup import TICK_INTERVAL_SECONDS
@@ -131,7 +132,7 @@ def test_main_applies_migrations_and_starts_polling(
     """Старт создаёт базу со схемой, поднимает планировщик и уходит в опрос."""
     started_schedulers: list[Any] = []
     jobs_at_start: list[dict[str, Any]] = []
-    original: Callable[..., Any] = entry_point.start_scheduler
+    original: Callable[..., Any] = composition_root.start_scheduler
 
     async def recording_start(scheduler: Any, clock: Any, reminder_repo: Any) -> None:
         await original(scheduler, clock, reminder_repo)
@@ -140,7 +141,7 @@ def test_main_applies_migrations_and_starts_polling(
         # выбрасывает задания из хранилища в памяти, и после main() список пуст.
         jobs_at_start.append({job.id: job for job in scheduler.get_jobs()})
 
-    monkeypatch.setattr(entry_point, "start_scheduler", recording_start)
+    monkeypatch.setattr(composition_root, "start_scheduler", recording_start)
 
     entry_point.main()
 
@@ -201,7 +202,7 @@ def test_sigterm_stops_polling_and_closes_everything(
     session = PollingSession()
     schedulers: list[Any] = []
     connections: list[sqlite3.Connection] = []
-    original_build: Callable[..., Any] = entry_point.build_scheduler
+    original_build: Callable[..., Any] = composition_root.build_scheduler
     original_connect: Callable[..., sqlite3.Connection] = entry_point.connect
 
     def recording_build(*args: Any, **kwargs: Any) -> Any:
@@ -214,7 +215,7 @@ def test_sigterm_stops_polling_and_closes_everything(
         connections.append(connection)
         return connection
 
-    monkeypatch.setattr(entry_point, "build_scheduler", recording_build)
+    monkeypatch.setattr(composition_root, "build_scheduler", recording_build)
     monkeypatch.setattr(entry_point, "connect", recording_connect)
     monkeypatch.setattr(
         entry_point, "build_bot", lambda settings: Bot(token=TEST_TOKEN, session=session)

@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramAPIError
 from aiogram.methods import GetMe, SendMessage, TelegramMethod
 from aiogram.types import Chat, Message, Update, User
 from tests.core.fakes import FixedClock
@@ -31,11 +32,18 @@ BOT_USERNAME = "kinday_test_bot"
 
 
 class FakeSession(BaseSession):
-    """Сессия, которая ничего не отправляет, а записывает вызовы Telegram API."""
+    """Сессия, которая ничего не отправляет, а записывает вызовы Telegram API.
+
+    `send_error` — класс ошибки aiogram, которой отвечает любая попытка
+    отправить сообщение, пока он выставлен. Так сквозной тест проигрывает 403
+    от Telegram, не подменяя ни notifier, ни тик: отказ приходит оттуда же,
+    откуда пришёл бы настоящий, и переводит его настоящий `TelegramNotifier`.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[TelegramMethod[object]] = []
+        self.send_error: type[TelegramAPIError] | None = None
 
     async def close(self) -> None: ...
 
@@ -43,6 +51,8 @@ class FakeSession(BaseSession):
         self, bot: Bot, method: TelegramMethod[object], timeout: int | None = None
     ) -> object:
         self.calls.append(method)
+        if self.send_error is not None and isinstance(method, SendMessage):
+            raise self.send_error(method=method, message="Forbidden: bot was blocked by the user")
         # Имя бота нужно по-настоящему: из него собирается ссылка-приглашение
         # `t.me/<bot>?start=<код>` (SPEC 3.2).
         if isinstance(method, GetMe):
