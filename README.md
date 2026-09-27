@@ -4,23 +4,86 @@ Telegram-бот семейных напоминаний: хранит генеа
 важными датами и заранее напоминает о них каждому родственнику в личном чате.
 Полная спецификация — [SPEC.md](SPEC.md).
 
-## Запуск
+## Установка на сервере
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # если uv ещё не установлен
-uv sync                                           # зависимости
-git config core.hooksPath .githooks               # включить проверки перед коммитом
-cp .env.example .env && $EDITOR .env              # заполнить BOT_TOKEN
-uv run python -m kinday                           # старт бота и планировщика
-```
+1. Установить зависимости и скопировать конфигурацию:
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh   # если uv ещё не установлен
+   sudo apt-get update && sudo apt-get install -y sqlite3
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin kinday
+   sudo mkdir -p /opt/kinday /var/lib/kinday/backups /etc/kinday
+   sudo chown -R kinday:kinday /var/lib/kinday
+   ```
+
+2. Скопировать репозиторий и установить зависимости:
+   ```bash
+   cd /opt
+   sudo git clone https://github.com/anakincode-dev/kinday.git kinday
+   cd kinday
+   sudo chown -R kinday:kinday /opt/kinday
+   sudo -u kinday uv sync
+   ```
+
+3. Настроить токен и запустить сервис:
+   ```bash
+   sudo cp deploy/kinday.env.example /etc/kinday/token.env
+   sudo chmod 600 /etc/kinday/token.env
+   sudo chown root:root /etc/kinday/token.env
+   # Отредактируйте /etc/kinday/token.env и укажите реальный BOT_TOKEN
+   sudo cp deploy/kinday.service /etc/systemd/system/
+   sudo cp deploy/kinday-backup.service /etc/systemd/system/
+   sudo cp deploy/kinday-backup.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now kinday kinday-backup.timer
+   ```
 
 ## Повседневные команды
 
 ```bash
-uv run pytest              # тесты
-uv run ruff check .        # линтер
-uv run ruff format .       # форматирование
-uv run ty check            # проверка типов
+cd /opt/kinday
+sudo -u kinday uv run pytest              # тесты
+sudo -u kinday uv run ruff check .        # линтер
+sudo -u kinday uv run ruff format .       # форматирование
+sudo -u kinday uv run ty check            # проверка типов
+```
+
+## Обновление
+
+```bash
+cd /opt/kinday
+sudo git pull --ff-only
+sudo -u kinday uv sync --frozen
+sudo systemctl restart kinday
+```
+
+## Восстановление из бэкапа
+
+Если база повреждена, восстановите из последнего бэкапа:
+
+```bash
+# Остановить сервис
+sudo systemctl stop kinday
+
+# Подменить файл базы (последний бэкап)
+sudo cp /var/lib/kinday/backups/kinday-*.db /var/lib/kinday/kinday.db
+# Удалить WAL-файлы от повреждённой базы
+sudo rm -f /var/lib/kinday/kinday.db-wal /var/lib/kinday/kinday.db-shm
+
+# Запустить сервис
+sudo systemctl start kinday
+```
+
+## Просмотр логов
+
+```bash
+# Журнал сервиса в реальном времени
+sudo journalctl -u kinday -f
+
+# Журнал таймера бэкапа
+sudo journalctl -u kinday-backup.timer -f
+
+# Журнал последнего бэкапа
+sudo journalctl -u kinday-backup.service -n 50
 ```
 
 ## Структура
@@ -33,9 +96,10 @@ src/kinday/
   telegram/      aiogram: роутеры, диалоги, реализация Notifier
   config.py      чтение переменных окружения
   __main__.py    точка входа
-tests/           тесты, включая проверку границы core
-.github/         CI и шаблоны issue и PR
-.githooks/       проверки перед коммитом
+deploy/        systemd-юниты и конфигурация
+tests/         тесты, включая проверку границы core
+.github/       CI и шаблоны issue и PR
+.githooks/     проверки перед коммитом
 ```
 
 Правила ведения работы описаны в [CONTRIBUTING.md](CONTRIBUTING.md), план

@@ -1,0 +1,12 @@
+[Unit]
+Description=Kinday - таймер ежедневного бэкапа
+Documentation=https://github.com/anakincode-dev/kinday
+
+[Timer]
+OnCalendar=daily
+AccuracySec=1h
+Persistent=true
+Unit=kinday-backup.service
+
+[Install]
+WantedBy=timers.target
