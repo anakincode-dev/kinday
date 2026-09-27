@@ -8,7 +8,12 @@ User=kinday
 Group=kinday
 WorkingDirectory=/opt/kinday
 ExecStart=/opt/kinday/.venv/bin/python -m kinday.backup
-EnvironmentFile=/etc/kinday/token.env
+Environment=DATABASE_PATH=/var/lib/kinday/kinday.db
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/kinday
 
 [Install]
 WantedBy=timers.target

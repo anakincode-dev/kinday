@@ -1,15 +1,16 @@
 [Unit]
 Description=Kinday - Telegram bot для семейных напоминаний
 Documentation=https://github.com/anakincode-dev/kinday
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=kinday
 Group=kinday
 WorkingDirectory=/opt/kinday
-ExecStartPre=/bin/bash -c 'curl -sS "https://api.telegram.org/bot$BOT_TOKEN/getMe" | grep -q "\"ok\":true" || { echo "Invalid BOT_TOKEN"; exit 1; }'
 ExecStart=/opt/kinday/.venv/bin/python -m kinday
+Environment=DATABASE_PATH=/var/lib/kinday/kinday.db
 EnvironmentFile=/etc/kinday/token.env
 Restart=on-failure
 RestartSec=5

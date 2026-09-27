@@ -88,6 +88,46 @@ class TestSystemdUnits:
         content = (DEPLOY_DIR / "kinday.service").read_text()
         assert "PrivateTmp=yes" in content, "Юнит должен иметь PrivateTmp=yes"
 
+    def test_kinday_service_has_database_path(self) -> None:
+        """kinday.service имеет Environment=DATABASE_PATH."""
+        content = (DEPLOY_DIR / "kinday.service").read_text()
+        assert "Environment=DATABASE_PATH=" in content, (
+            "Юнит должен иметь Environment=DATABASE_PATH"
+        )
+        assert "/var/lib/kinday/kinday.db" in content, (
+            "DATABASE_PATH должен указывать на /var/lib/kinday/kinday.db"
+        )
+
+    def test_kinday_service_has_network_online_target(self) -> None:
+        """kinday.service имеет After=network-online.target и Wants=network-online.target."""
+        content = (DEPLOY_DIR / "kinday.service").read_text()
+        assert "After=network-online.target" in content, (
+            "Юнит должен иметь After=network-online.target"
+        )
+        assert "Wants=network-online.target" in content, (
+            "Юнит должен иметь Wants=network-online.target"
+        )
+
+    def test_kinday_service_has_no_exec_start_pre(self) -> None:
+        """kinday.service не имеет ExecStartPre с curl."""
+        content = (DEPLOY_DIR / "kinday.service").read_text()
+        assert "ExecStartPre=" not in content, "Юнит не должен иметь ExecStartPre"
+
+    def test_kinday_backup_service_has_database_path(self) -> None:
+        """kinday-backup.service имеет Environment=DATABASE_PATH."""
+        content = (DEPLOY_DIR / "kinday-backup.service").read_text()
+        assert "Environment=DATABASE_PATH=" in content, (
+            "Юнит должен иметь Environment=DATABASE_PATH"
+        )
+        assert "/var/lib/kinday/kinday.db" in content, (
+            "DATABASE_PATH должен указывать на /var/lib/kinday/kinday.db"
+        )
+
+    def test_kinday_backup_service_has_no_environment_file(self) -> None:
+        """kinday-backup.service не имеет EnvironmentFile."""
+        content = (DEPLOY_DIR / "kinday-backup.service").read_text()
+        assert "EnvironmentFile=" not in content, "Юнит не должен иметь EnvironmentFile"
+
     def test_kinday_backup_service_has_backup_command(self) -> None:
         """kinday-backup.service имеет команду создания бэкапа."""
         content = (DEPLOY_DIR / "kinday-backup.service").read_text()
