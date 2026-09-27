@@ -21,7 +21,7 @@ Telegram-бот семейных напоминаний: хранит генеа
    sudo git clone /workspace/femevmen /opt/kinday
    sudo chown -R root:root /opt/kinday
    cd /opt/kinday
-   sudo -u kinday uv sync --frozen --python /usr/bin/python3.12
+   UV_LINK_MODE=copy /root/.local/bin/uv sync --frozen --no-dev --python /usr/bin/python3.12
    # Проверка: readlink -f /opt/kinday/.venv/bin/python
    # Должно быть: /usr/bin/python3.12
    ```
@@ -31,6 +31,11 @@ Telegram-бот семейных напоминаний: хранит генеа
    # Создать /etc/kinday/token.env с BOT_TOKEN (права 600, владелец root)
    sudo bash -c 'umask 077; echo "BOT_TOKEN=your_token_here" > /etc/kinday/token.env'
    sudo chmod 600 /etc/kinday/token.env
+
+   # Проверка токена (отдельный ручной шаг перед enable --now)
+   set -a; . /etc/kinday/token.env; set +a;
+   curl -sS "https://api.telegram.org/bot$BOT_TOKEN/getMe"
+
    # Дополнительно: ограничить журнал (см. ниже)
    sudo cp deploy/kinday.service /etc/systemd/system/
    sudo cp deploy/kinday-backup.service /etc/systemd/system/
@@ -43,25 +48,15 @@ Telegram-бот семейных напоминаний: хранит генеа
    ```bash
    sudo mkdir -p /etc/systemd/journald.conf.d
    sudo cp deploy/journald-kinday.conf /etc/systemd/journald.conf.d/
-   sudo systemctl reload systemd-journald
+   sudo systemctl restart systemd-journald
    ```
-
-## Повседневные команды
-
-```bash
-cd /opt/kinday
-sudo -u kinday uv run pytest              # тесты
-sudo -u kinday uv run ruff check .        # линтер
-sudo -u kinday uv run ruff format .       # форматирование
-sudo -u kinday uv run ty check            # проверка типов
-```
 
 ## Обновление
 
 ```bash
 cd /opt/kinday
 sudo git pull --ff-only
-sudo -u kinday uv sync --frozen --python /usr/bin/python3.12
+UV_LINK_MODE=copy /root/.local/bin/uv sync --frozen --no-dev --python /usr/bin/python3.12
 sudo systemctl restart kinday
 ```
 
