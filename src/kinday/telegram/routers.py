@@ -96,7 +96,6 @@ MENU = (
     "/settings — за сколько дней и во сколько напоминать\n"
     "/event_settings — своё расписание для одного события\n"
     "/family — выбрать текущую семью\n"
-    "/persons — список людей семьи\n"
     "/cancel — прервать диалог"
 )
 
@@ -1179,60 +1178,6 @@ async def choosing_family(message: Message, state: FSMContext, deps: Deps) -> No
     )
 
 
-async def cmd_persons(message: Message, deps: Deps) -> None:
-    """Команда /persons: показывает всех людей текущей семьи (SPEC 3.5).
-
-    - Любой участник семьи видит список (владелец или приглашённый).
-    - Показывает только людей текущей семьи, заглушки не показываются.
-    - Один человек = строка с именем, датой рождения, возрастом, родством и событиями.
-    - Если список слишком длинный, обрывается с «… и ещё N человек».
-    """
-    family_id = await _current_family_id(message, deps)
-    if family_id is None:
-        return
-
-    account = await _account_of(message, deps)
-    if account is None:
-        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Получаем person_id текущего аккаунта
-    current_membership = await deps.membership.get_by_account_and_family(account.id, family_id)
-    if current_membership is None:
-        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
-        return
-
-    try:
-        family_name, persons = await services.get_family_persons(
-            family_id,
-            current_membership.person_id,
-            deps.person,
-            deps.event,
-            deps.relation,
-            deps.clock,
-        )
-    except ValueError as error:
-        await message.answer(user_text(error), reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Получаем person_id текущего аккаунта
-    current_membership = await deps.membership.get_by_account_and_family(account.id, family_id)
-    if current_membership is None:
-        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
-        return
-
-    from kinday.core.texts import format_persons_list
-
-    text = format_persons_list(
-        persons=persons,
-        family_name=family_name,
-        current_user_person_id=current_membership.person_id,
-    )
-
-    # Отправляем (максимум 3800 символов, проверка внутри format_persons_list)
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
-
-
 async def fallback(message: Message) -> None:
     await message.answer(NOT_UNDERSTOOD, reply_markup=ReplyKeyboardRemove())
 
@@ -1264,7 +1209,6 @@ def build_router() -> Router:
     router.message.register(cmd_add_event, Command("add_event"))
     router.message.register(cmd_invite, Command("invite"))
     router.message.register(cmd_timezone, Command("timezone"))
-    router.message.register(cmd_persons, Command("persons"))
     router.message.register(cmd_settings, Command("settings"))
     router.message.register(cmd_event_settings, Command("event_settings"))
     router.message.register(cmd_family, Command("family"))

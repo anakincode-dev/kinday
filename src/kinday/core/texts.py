@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import NamedTuple
 
-from kinday.core.models import Event, EventKind, Gender, Person
+from kinday.core.models import Gender
 
 _MONTHS_GENITIVE = (
     "января",
@@ -114,111 +113,3 @@ def reminder_text(
     if is_recurring_yearly:
         return f"{lead}: {event_title} — {subject}. {formatted_date}, {years} {_years_word(years)}."
     return f"{lead}: {event_title} — {subject}. {formatted_date}."
-
-
-class PersonInfo(NamedTuple):
-    """Информация о человеке для списка семьи (SPEC 3.5)."""
-
-    person: Person
-    events: list[Event]
-    relation_text: str | None
-    age: int | None
-
-
-def _format_person_with_events(
-    name: str,
-    birth_date: date | None,
-    age: int | None,
-    relation_text: str | None,
-    events: list[Event],
-    is_current_user: bool,
-) -> str:
-    """Форматирует строку человека в списке семьи.
-
-    - Имя, дата рождения ДД.ММ.ГГГГ, возраст на сегодня по часовому поясу пользователя,
-      родство одним словом («отец», «сестра», «дядя»).
-    - Под строкой — события человека, кроме дня рождения.
-    """
-    lines: list[str] = []
-
-    # Основная строка человека
-    date_part = f", {birth_date.strftime('%d.%m.%Y')}" if birth_date else ""
-    age_part = f", {age} {_years_word(age)}" if age is not None else ""
-    relation_part = f" ({relation_text})" if relation_text else ""
-    current_user_part = " (это вы)" if is_current_user else ""
-
-    lines.append(f"{name}{date_part}{age_part}{relation_part}{current_user_part}")
-
-    # События (кроме дня рождения)
-    for event in events:
-        if event.kind == EventKind.BIRTHDAY:
-            continue
-        formatted_date = _format_date(event.date)
-        if event.is_recurring_yearly:
-            lines.append(f"  • {formatted_date} — {event.title} (с {event.date.year})")
-        else:
-            lines.append(f"  • {event.date.strftime('%d.%m.%Y')} — {event.title}")
-
-    return "\n".join(lines)
-
-
-def format_persons_list(
-    persons: list[PersonInfo],
-    family_name: str,
-    current_user_person_id: int,
-    max_length: int = 3800,
-) -> str:
-    """Формирует текст списка людей семьи (SPEC 3.5, критерий 33).
-
-    - Порядок: сам пользователь, его родители, супруги, дети, остальные
-      (группы определяются прямыми связями `parent_of` и `spouse_of`).
-    - Один человек = одна строка + события (если есть).
-    - Если текст длиннее `max_length`, обрывается на границе человека с «… и ещё N человек».
-    """
-    lines: list[str] = [f"Семья «{family_name}»:"]
-    total_count = len(persons)
-
-    # Собираем строки, пока не достигнем лимита
-    current_length = 0
-    shown_count = 0
-    overflow_count = 0
-
-    for info in persons:
-        person_str = _format_person_with_events(
-            name=info.person.name or "Без имени",
-            birth_date=info.person.birth_date,
-            age=info.age,
-            relation_text=info.relation_text,
-            events=info.events,
-            is_current_user=info.person.id == current_user_person_id,
-        )
-
-        # Добавляем разделитель перед строкой (кроме первой после заголовка)
-        new_lines = [person_str]
-        if lines[-1] != f"Семья «{family_name}»:":  # Не первая группа
-            new_lines.insert(0, "")  # Пустая строка-разделитель
-
-        for new_line in new_lines:
-            if current_length + len(new_line) + 1 > max_length:
-                overflow_count = total_count - shown_count
-                break
-            current_length += len(new_line) + 1  # +1 для \n
-
-        if overflow_count > 0:
-            break
-
-        lines.append(person_str)
-        current_length += 1  # разделитель
-
-    # Если был обрыв, добавляем счётчик
-    if overflow_count > 0:
-        # Склонение "человек/человека/человек"
-        if overflow_count % 10 == 1 and overflow_count % 100 != 11:
-            people_word = "человек"
-        elif 2 <= overflow_count % 10 <= 4 and not 12 <= overflow_count % 100 <= 14:
-            people_word = "человека"
-        else:
-            people_word = "человек"
-        lines.append(f"… и ещё {overflow_count} {people_word}")
-
-    return "\n".join(lines)

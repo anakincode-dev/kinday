@@ -61,7 +61,7 @@ from kinday.core.reminders import (
     is_overdue,
     materialize_for_event,
 )
-from kinday.core.texts import PersonInfo, reminder_text
+from kinday.core.texts import reminder_text
 
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
@@ -1352,120 +1352,6 @@ async def compose_reminder_text(
         event_date=reminder.occurrence_date,
         years=age_on(event.date, reminder.occurrence_date),
     )
-
-
-async def get_family_persons(
-    family_id: int,
-    current_person_id: int,
-    person_repo: PersonRepo,
-    event_repo: EventRepo,
-    relation_repo: RelationRepo,
-    clock: Clock,
-) -> tuple[str, list[PersonInfo]]:
-    """Получает список людей семьи для команды /persons (SPEC 3.5).
-
-    Возвращает (family_name, persons_list):
-    - family_name — имя семьи для заголовка
-    - persons_list — список PersonInfo с данными о каждом человеке
-
-    Порядок: сам пользователь, его родители, супруги, дети, остальные.
-    Группы определяются прямыми связями `parent_of` и `spouse_of`.
-    """
-    # Получаем все данные сразу
-    people = await person_repo.list_by_family(family_id)
-    relations = await relation_repo.list_by_family(family_id)
-    events = await event_repo.list_by_family(family_id)
-
-    # Фильтруем заглушки
-    real_people = [p for p in people if not p.is_placeholder]
-
-    # Получаем текущего пользователя
-    current_person = next(
-        (p for p in real_people if p.id == current_person_id),
-        None,
-    )
-
-    # Собираем события по людям
-    events_by_person: dict[int, list[Event]] = {}
-    for event in events:
-        if event.kind == EventKind.BIRTHDAY:
-            continue  # Дни рождения в списке не показываем
-        events_by_person.setdefault(event.person_id, []).append(event)
-
-    # Считаем возрасты (текущий пользователь получает свой возраст)
-    today = clock.now().date()
-
-    # Сортируем людей по группам
-    def get_person_group(person: Person) -> int:
-        """Возвращает порядковый номер группы человека.
-
-        0 - сам пользователь
-        1 - родители
-        2 - супруги
-        3 - дети
-        4 - остальные
-        """
-        if person.id == current_person.id if current_person else False:
-            return 0
-
-        # Родители: есть ребро child_of к этому человеку
-        if any(isinstance(r, ParentOf) and r.child_id == person.id for r in relations):
-            return 1
-
-        # Супруги: есть ребро spouse_of к этому человеку
-        if any(isinstance(r, SpouseOf) and person.id in (r.a_id, r.b_id) for r in relations):
-            return 2
-
-        # Дети: есть ребро parent_of от этого человека
-        if any(isinstance(r, ParentOf) and r.parent_id == person.id for r in relations):
-            return 3
-
-        return 4
-
-    def sort_key(person: Person) -> tuple[int, str, int]:
-        """Ключ сортировки: группа, имя без учёта регистра и ё, порядок добавления."""
-        # Нормализуем имя для сортировки: ё -> е, lower
-        name_for_sort = (person.name or "").casefold().replace("ё", "е")
-        return (get_person_group(person), name_for_sort, person.id)
-
-    sorted_people = sorted(real_people, key=sort_key)
-
-    # Формируем PersonInfo для каждого человека
-    result: list[PersonInfo] = []
-    for person in sorted_people:
-        person_events = events_by_person.get(person.id, [])
-
-        # Получаем родство (только если есть текущий пользователь)
-        relation_text = None
-        if current_person:
-            rel = infer_relation_text(
-                current_person.id,
-                person.id,
-                {p.id: p for p in real_people},
-                relations,
-            )
-            if rel:
-                # Извлекаем только слово о родстве (без "Вы" или "вы")
-                relation_text = rel.split(", ")[-1] if ", " in rel else rel
-
-        # Считаем возраст
-        age = None
-        if person.birth_date:
-            age = age_on(person.birth_date, today)
-
-        result.append(
-            PersonInfo(
-                person=person,
-                events=person_events,
-                relation_text=relation_text,
-                age=age,
-            )
-        )
-
-    # Имя семьи
-    family_name = "Семья"  # По умолчанию
-
-    return family_name, result
 
 
 async def disable_delivery(
