@@ -50,7 +50,14 @@ async def test_format_persons_list_empty_family() -> None:
     anton = next(p for p in repos.person.people.values() if p.name == "Антон")
 
     persons = await get_family_persons(family.id, repos.person, repos.relation)
-    text = format_persons_list(persons, anton.id, "Europe/Moscow", CLOCK.now())
+    text = await format_persons_list(
+        persons,
+        anton.id,
+        "Europe/Moscow",
+        CLOCK.now(),
+        relation_repo=repos.relation,
+        event_repo=repos.event,
+    )
 
     assert "Антон" in text
     assert "15.06.1990" in text

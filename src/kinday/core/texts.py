@@ -35,6 +35,19 @@ _RELATION_WORDS: dict[str, dict[Gender, str]] = {
     "grandchild_child": {Gender.MALE: "ваш правнук", Gender.FEMALE: "ваша правнучка"},
 }
 
+_RELATION_WORDS_BARE: dict[str, dict[Gender, str]] = {
+    "parent": {Gender.MALE: "отец", Gender.FEMALE: "мать"},
+    "child": {Gender.MALE: "сын", Gender.FEMALE: "дочь"},
+    "spouse": {Gender.MALE: "муж", Gender.FEMALE: "жена"},
+    "sibling": {Gender.MALE: "брат", Gender.FEMALE: "сестра"},
+    "grandparent": {Gender.MALE: "дедушка", Gender.FEMALE: "бабушка"},
+    "grandchild": {Gender.MALE: "внук", Gender.FEMALE: "внучка"},
+    "parent_sibling": {Gender.MALE: "дядя", Gender.FEMALE: "тётя"},
+    "sibling_child": {Gender.MALE: "племянник", Gender.FEMALE: "племянница"},
+    "grandparent_parent": {Gender.MALE: "прадедушка", Gender.FEMALE: "прабабушка"},
+    "grandchild_child": {Gender.MALE: "правнук", Gender.FEMALE: "правнучка"},
+}
+
 
 def relation_word(relation: str, gender: Gender | None) -> str:
     """«ваш отец» / «ваша сестра» и т.п. — именительный падеж для вставки в reminder_text.
@@ -49,6 +62,13 @@ def relation_word(relation: str, gender: Gender | None) -> str:
     if gender is None:
         return ""
     return _RELATION_WORDS.get(relation, {}).get(gender, "")
+
+
+def relation_word_bare(relation: str, gender: Gender | None) -> str:
+    """«отец» / «сестра» и т.п. — для вывода в /persons без префикса «ваш/ваша»."""
+    if gender is None:
+        return ""
+    return _RELATION_WORDS_BARE.get(relation, {}).get(gender, "")
 
 
 def _days_word(n: int) -> str:
@@ -172,11 +192,13 @@ def _person_block(item: PersonListItem) -> str:
     return line + "\n" + "\n".join(_format_event_line(event) for event in item.events)
 
 
-def format_persons_list(
+async def format_persons_list(
     persons: list,  # list[Person]
     viewing_person_id: int,
     timezone: str,
     now,  # datetime
+    relation_repo=None,  # RelationRepo
+    event_repo=None,  # EventRepo
     max_length: int = PERSONS_LIST_MAX_LENGTH,
 ) -> str:
     """Собирает одно сообщение /persons не длиннее `max_length` символов (SPEC 3.5, критерии 29-34).
@@ -186,6 +208,8 @@ def format_persons_list(
     - viewing_person_id: ID зрителя (для пометки "это вы" и определения родства)
     - timezone: часовой пояс зрителя (для расчёта возраста)
     - now: текущий момент в UTC (для расчёта возраста)
+    - relation_repo: репозиторий отношений (для получения типа родства)
+    - event_repo: репозиторий событий (для получения событий человека)
 
     Обрыв — на границе человека, с «… и ещё N человек». Если в семье только
     сам зритель, показывает подсказку.
@@ -193,6 +217,7 @@ def format_persons_list(
     from zoneinfo import ZoneInfo
 
     from kinday.core.recurrence import age_as_of
+    from kinday.core.relations import infer_relation_text
 
     # Преобразуем UTC в локальное время зрителя для расчёта возраста
     local_tz = ZoneInfo(timezone)
@@ -201,6 +226,18 @@ def format_persons_list(
 
     # Сортируем по ID и исключаем заглушки
     sorted_persons = sorted((p for p in persons if not p.is_placeholder), key=lambda p: p.id)
+
+    # Получаем отношения и события
+    relations = []
+    all_events = []
+    if len(sorted_persons) > 0:
+        if relation_repo:
+            relations = await relation_repo.list_by_family(sorted_persons[0].family_id)
+        if event_repo:
+            all_events = await event_repo.list_by_family(sorted_persons[0].family_id)
+
+    # Создаём словарь людей для infer_relation_text
+    people_dict = {p.id: p for p in sorted_persons}
 
     blocks: list[str] = []
     for person in sorted_persons:
@@ -211,6 +248,26 @@ def format_persons_list(
         line = f"{person.name} — {person.birth_date.strftime('%d.%m.%Y')}, {age} {_years_word(age)}"
         if person.id == viewing_person_id:
             line += " (это вы)"
+        else:
+            # Получаем слово родства через infer_relation_text
+            rel_phrase = infer_relation_text(viewing_person_id, person.id, people_dict, relations)
+            if rel_phrase:
+                # rel_phrase имеет вид "ваш отец", нужно оставить только "отец"
+                words = rel_phrase.split()
+                if len(words) > 1:
+                    rel_word = words[-1]
+                    line += f", {rel_word}"
+
+        # Получаем события человека (кроме дня рождения)
+        person_events = [e for e in all_events if e.person_id == person.id and not e.is_birthday]
+        for event in person_events:
+            event_line = f"{event.date.month}.{event.date.day:02d}"
+            if not event.is_recurring_yearly:
+                event_line += f".{event.date.year}"
+                line += f"\n{event_line} — {event.title}"
+            else:
+                event_line += f" — {event.title} (с {event.date.year})"
+                line += f"\n{event_line}"
 
         blocks.append(line)
 

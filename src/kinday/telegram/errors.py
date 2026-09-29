@@ -137,18 +137,11 @@ async def on_error(event: ErrorEvent, state: FSMContext | None = None) -> bool:
     """
     message = event.update.message
     user = message.from_user if message is not None else None
-    import traceback
-
     logger.error(
-        "Необработанная ошибка %s: update_id=%s, пользователь=%s\n%s",
+        "Необработанная ошибка %s: update_id=%s, пользователь=%s",
         type(event.exception).__name__,
         event.update.update_id,
         user.id if user is not None else None,
-        "".join(
-            traceback.format_exception(
-                type(event.exception), event.exception, event.exception.__traceback__
-            )
-        ),
     )
     if state is not None:
         await state.clear()

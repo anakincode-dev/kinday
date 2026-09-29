@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
+import pytest
+
 from kinday.core.models import Person
 from kinday.core.texts import format_persons_list
 
 
-def test_format_persons_list_single_person_with_self_marker() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_single_person_with_self_marker() -> None:
     """Один человек в списке получает пометку "(это вы)"."""
     people = [
         Person(
@@ -22,7 +25,7 @@ def test_format_persons_list_single_person_with_self_marker() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "Антон" in text
     assert "15.06.1990" in text
@@ -30,7 +33,8 @@ def test_format_persons_list_single_person_with_self_marker() -> None:
     assert text.count("Антон") == 1  # без дублей
 
 
-def test_format_persons_list_age_calculation() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_age_calculation() -> None:
     """Возраст считается правильно по московскому времени."""
     # 15 февраля 2027:
     # - Антон (15.06.1990) — 36 лет (ещё не родился в этом году)
@@ -65,14 +69,15 @@ def test_format_persons_list_age_calculation() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "36" in text  # Антон
     assert "47" in text  # Пётр
     assert "34" in text  # Марина
 
 
-def test_format_persons_list_format_person_line() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_format_person_line() -> None:
     """Формат строки человека: имя, дата, возраст, родство, пометка."""
     people = [
         Person(
@@ -86,7 +91,7 @@ def test_format_persons_list_format_person_line() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "Иван" in text
     assert "01.01.1985" in text
@@ -94,7 +99,8 @@ def test_format_persons_list_format_person_line() -> None:
     assert "это вы" in text
 
 
-def test_format_persons_list_sorts_by_category() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_sorts_by_category() -> None:
     """Люди сортируются по категориям: сам, родители, супруги, дети, остальные."""
     # Структура:
     # - Антон (id=1) — сам
@@ -156,7 +162,7 @@ def test_format_persons_list_sorts_by_category() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     # Извлекаем имена по порядку из текста (пропускаем пустые и заголовок "Семья:")
     lines = [
@@ -175,18 +181,20 @@ def test_format_persons_list_sorts_by_category() -> None:
     assert any("Татьяна" in line for line in lines)
 
 
-def test_format_persons_list_empty_list() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_empty_list() -> None:
     """Пустой список даёт только приветствие."""
     people = []
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "семья" in text.lower()
     # Пустой список — нет других людей
 
 
-def test_format_persons_list_truncation_adds_more_people() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_truncation_adds_more_people() -> None:
     """При обрезке добавляется строка "… и ещё N человек"."""
     # Создаём достаточно много людей, чтобы превысить 3800 символов
     people = [
@@ -202,12 +210,13 @@ def test_format_persons_list_truncation_adds_more_people() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "… и ещё" in text
 
 
-def test_format_persons_list_events_under_person_line() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_events_under_person_line() -> None:
     """События отображаются под строкой человека."""
     # Для теста без зависимостей от сценариев проверим, что текст содержит
     # события под строками людей (реальная реализация будет добавлять события)
@@ -224,14 +233,15 @@ def test_format_persons_list_events_under_person_line() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     # В простом случае без событий — просто строка человека
     assert "Антон" in text
     assert "01.06.1990" in text or "15.06.1990" in text
 
 
-def test_format_persons_list_names_sorted_case_insensitive() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_names_sorted_case_insensitive() -> None:
     """Имена сортируются без учёта регистра, ё как е."""
     people = [
         Person(
@@ -261,7 +271,7 @@ def test_format_persons_list_names_sorted_case_insensitive() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     # Проверяем, что имена включены
     assert "Антон" in text
@@ -269,7 +279,8 @@ def test_format_persons_list_names_sorted_case_insensitive() -> None:
     assert "Алексей" in text
 
 
-def test_format_persons_list_same_age_sorted_by_name() -> None:
+@pytest.mark.asyncio
+async def test_format_persons_list_same_age_sorted_by_name() -> None:
     """При равном возрасте сортировка по имени."""
     people = [
         Person(
@@ -299,7 +310,7 @@ def test_format_persons_list_same_age_sorted_by_name() -> None:
     ]
     clock = datetime(2027, 2, 15, tzinfo=UTC)
 
-    text = format_persons_list(people, 1, "Europe/Moscow", clock)
+    text = await format_persons_list(people, 1, "Europe/Moscow", clock)
 
     assert "Антон" in text
     assert "Борис" in text

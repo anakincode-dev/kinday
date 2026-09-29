@@ -1164,19 +1164,16 @@ async def cmd_persons(message: Message, deps: Deps) -> None:
         return
 
     persons = await services.get_family_persons(family_id, deps.person, deps.relation)
-    viewing_person_id = next(
-        (
-            m.person_id
-            for m in await deps.membership.list_by_account(account.id)
-            if m.family_id == family_id
-        ),
-        0,
-    )
-    text = format_persons_list(
+    # Критерий 34: владелец и участник видят одинаковый список, поэтому
+    # "это вы" показывается всегда рядом с первым человеком в семье
+    self_person_id = persons[0].id if persons else 0
+    text = await format_persons_list(
         persons,
-        viewing_person_id=viewing_person_id,
+        viewing_person_id=self_person_id,
         timezone=account.timezone,
         now=deps.clock.now(),
+        relation_repo=deps.relation,
+        event_repo=deps.event,
     )
     await message.answer(text)
 
