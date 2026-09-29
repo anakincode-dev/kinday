@@ -1500,7 +1500,7 @@ async def get_family_persons(
     result.append((current_person, "(это вы)", non_birthday_events))
 
     # Остальные люди с определением категории
-    other_people: list[tuple[Person, str]] = []
+    other_people: list[tuple[Person, str, list[Event]]] = []
     for person in all_people:
         if person.id == current_person_id or person.is_placeholder:
             continue
