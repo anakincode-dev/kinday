@@ -217,7 +217,7 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
 - `src/kinday/backup/`: модуль `BackupManager` с ротацией 14 копий
 - `tests/infratest/`: 21 тест для systemd и backup
 
-## Этап 9. Команда /persons
+## Этап 9. Команда /persons (готово)
 
 - `core/services.py`: `get_family_persons` — получение списка людей с родством,
   сортировкой по категориям, вычислением возраста по поясу.
@@ -225,8 +225,10 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
   добавление «… и ещё N человек» при обрыве.
 - `telegram/routers.py`: хендлер `/persons`, строка в `MENU`.
 - `USERGUIDE.md`: описание команды `/persons` по аналогии с другими командами.
-- `tests/core/test_persons.py`: сервис через фикстуру `world`, критерии 29–34.
+- `tests/core/test_persons.py`: сервис через фикстуру `repos`, критерии 29–34.
 - `tests/core/test_persons_texts.py`: чистые юнит-тесты форматтера.
-- `tests/telegram/test_persons.py`: хендлер с фейковым апдейтом aiogram.
+- `tests/telegram/test_persons_command.py`: хендлер с фейковым апдейтом aiogram.
+
+Готово: все тесты проходят, критерии 29–34 покрыты.
 
 Миграций и новых зависимостей нет.

@@ -91,6 +91,7 @@ MENU = (
     "/join — присоединиться по коду приглашения\n"
     "/add_person — добавить родственника\n"
     "/add_event — добавить событие\n"
+    "/persons — список людей семьи\n"
     "/invite — выдать приглашение на запись\n"
     "/timezone — сменить часовой пояс\n"
     "/settings — за сколько дней и во сколько напоминать\n"
@@ -408,6 +409,74 @@ async def cmd_help(message: Message) -> None:
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Отменил.\n\n" + MENU, reply_markup=ReplyKeyboardRemove())
+
+
+async def cmd_persons(message: Message, deps: Deps) -> None:
+    """Команда /persons: показать список людей семьи (SPEC 3.5, этап 9)."""
+    if message.from_user is None:
+        return
+    try:
+        account = await deps.account.get_by_telegram_user_id(message.from_user.id)
+    except KeyError:
+        await message.answer(
+            "Вы ещё не создали ни одной семьи. Начните с /new_family",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    assert account is not None
+
+    if account.current_family_id is None:
+        await message.answer(
+            "Выберите семью командой /family, а пока что семей нет",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    try:
+        family = await deps.family.get(account.current_family_id)
+        persons_data = await services.get_family_persons(
+            account_id=account.id,
+            family_id=family.id,
+            current_date=deps.clock.now().date(),
+            timezone=account.timezone,
+            person_repo=deps.person,
+            membership_repo=deps.membership,
+            relation_repo=deps.relation,
+            event_repo=deps.event,
+        )
+
+        if not persons_data:
+            await message.answer(
+                "В семье пока нет людей",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        from kinday.core.texts import format_persons_list
+
+        text = format_persons_list(
+            family_name=family.name,
+            persons_data=persons_data,
+            current_date=deps.clock.now().date(),
+        )
+
+        # Если только сам пользователь
+        if len(persons_data) == 1:
+            is_owner = family.owner_account_id == account.id
+            if is_owner:
+                text += "\n\nВ семье пока только вы. Пригласите родственников командой /invite"
+            else:
+                text += "\n\nВ семье пока только вы"
+
+        await message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+    except Exception as e:
+        logger.exception("cmd_persons error: %s", e)
+        await message.answer(
+            "Ошибка при получении списка людей",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 async def cmd_new_family(message: Message, state: FSMContext) -> None:
@@ -1203,6 +1272,7 @@ def build_router() -> Router:
     router.message.register(cmd_start, CommandStart())
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_cancel, Command("cancel"))
+    router.message.register(cmd_persons, Command("persons"))
     router.message.register(cmd_new_family, Command("new_family"))
     router.message.register(cmd_join, Command("join"))
     router.message.register(cmd_add_person, Command("add_person"))
