@@ -1447,3 +1447,93 @@ async def enable_delivery(
                     event, membership, account, override_repo, reminder_repo, clock
                 )
         return account
+
+
+async def get_family_persons(
+    account_id: int,
+    family_id: int,
+    current_date: date,
+    timezone: str,
+    person_repo: PersonRepo,
+    membership_repo: MembershipRepo,
+    relation_repo: RelationRepo,
+    event_repo: EventRepo,
+) -> list[tuple[Person, str, list[Event]]]:
+    """Получить людей семьи с информацией для команды /persons (этап 9, SPEC 3.5).
+
+    Возвращает список кортежей (Person, relation_category, events):
+    - Person: запись человека
+    - relation_category: текст родства от текущего пользователя (или «(это вы)» для себя)
+    - events: список событий человека, кроме дня рождения
+
+    Список отсортирован по категориям: сам, родители, супруги, дети, остальные.
+    Заглушки и люди других семей исключены.
+    Критерии приёмки 29–34 в SPEC.
+    """
+    # Получить текущего человека через membership
+    current_person_id: int | None = None
+    for membership in await membership_repo.list_by_account(account_id):
+        if membership.family_id == family_id:
+            current_person_id = membership.person_id
+            break
+
+    if current_person_id is None:
+        return []
+
+    current_person = await person_repo.get(current_person_id)
+    if current_person.is_placeholder:
+        return []
+
+    # Получить всех людей семьи
+    all_people = await person_repo.list_by_family(family_id)
+    people_by_id = {p.id: p for p in all_people}
+
+    # Получить рёбра семьи для вывода родства
+    relations = await relation_repo.list_by_family(family_id)
+
+    # Определить категорию каждого человека
+    result: list[tuple[Person, str, list[Event]]] = []
+
+    # Сам пользователь
+    events = await event_repo.list_by_person(current_person_id)
+    non_birthday_events = [e for e in events if e.kind != EventKind.BIRTHDAY]
+    result.append((current_person, "(это вы)", non_birthday_events))
+
+    # Остальные люди с определением категории
+    other_people: list[tuple[Person, str]] = []
+    for person in all_people:
+        if person.id == current_person_id or person.is_placeholder:
+            continue
+
+        # Определить категорию
+        relation_text = infer_relation_text(current_person_id, person.id, people_by_id, relations)
+        if not relation_text:
+            relation_text = ""
+
+        # Получить события
+        events = await event_repo.list_by_person(person.id)
+        non_birthday_events = [e for e in events if e.kind != EventKind.BIRTHDAY]
+
+        other_people.append((person, relation_text, non_birthday_events))
+
+    # Сортировка: родители, супруги, дети, остальные
+    def sort_key(item: tuple[Person, str, list[Event]]) -> tuple[int, str]:
+        person, relation_text, _ = item
+        # Категория: 0=родитель, 1=супруг, 2=ребёнок, 3=остальное
+        if "отец" in relation_text or "мать" in relation_text:
+            category = 0
+        elif "муж" in relation_text or "жен" in relation_text:
+            category = 1
+        elif "сын" in relation_text or "дочь" in relation_text:
+            category = 2
+        else:
+            category = 3
+
+        # Внутри категории сортировать по имени (без учёта регистра)
+        name = person.name or ""
+        return (category, name.lower().replace("ё", "е"))
+
+    other_people.sort(key=sort_key)
+
+    result.extend(other_people)
+    return result
