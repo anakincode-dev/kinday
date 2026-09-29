@@ -1150,6 +1150,37 @@ async def cmd_family(message: Message, state: FSMContext, deps: Deps) -> None:
     )
 
 
+async def cmd_persons(message: Message, deps: Deps) -> None:
+    """Команда /persons: показать список людей семьи с их информацией."""
+    from kinday.core.texts import format_persons_list
+
+    account = await _account_of(message, deps)
+    if account is None:
+        await message.answer(NO_FAMILY)
+        return
+    family_id = account.current_family_id
+    if family_id is None:
+        await message.answer(NO_FAMILY)
+        return
+
+    persons = await services.get_family_persons(family_id, deps.person, deps.relation)
+    viewing_person_id = next(
+        (
+            m.person_id
+            for m in await deps.membership.list_by_account(account.id)
+            if m.family_id == family_id
+        ),
+        0,
+    )
+    text = format_persons_list(
+        persons,
+        viewing_person_id=viewing_person_id,
+        timezone=account.timezone,
+        now=deps.clock.now(),
+    )
+    await message.answer(text)
+
+
 async def choosing_family(message: Message, state: FSMContext, deps: Deps) -> None:
     account = await _account_of(message, deps)
     if account is None:
@@ -1212,6 +1243,7 @@ def build_router() -> Router:
     router.message.register(cmd_settings, Command("settings"))
     router.message.register(cmd_event_settings, Command("event_settings"))
     router.message.register(cmd_family, Command("family"))
+    router.message.register(cmd_persons, Command("persons"))
 
     router.message.register(new_family_name, NewFamily.name, F.text)
     router.message.register(new_family_gender, NewFamily.gender, F.text)

@@ -1447,3 +1447,106 @@ async def enable_delivery(
                     event, membership, account, override_repo, reminder_repo, clock
                 )
         return account
+
+
+# Порядок групп в списке /persons (SPEC 8, критерий 30): сам, родители, супруги, дети, остальные.
+_PERSONS_SELF = 0
+_PERSONS_PARENT = 1
+_PERSONS_SPOUSE = 2
+_PERSONS_CHILD = 3
+_PERSONS_OTHER = 4
+
+
+def _fold_name(name: str) -> str:
+    """Ключ сортировки имени: без регистра, «ё» как «е» (критерий 30)."""
+    return name.casefold().replace("ё", "е").replace("Ё", "е")
+
+
+async def get_family_persons(
+    family_id: int, person_repo: PersonRepo, relation_repo: RelationRepo
+) -> list[Person]:
+    """Список видимых людей семьи (исключает заглушки), отсортированный по категориям.
+
+    Используется для команды /persons (SPEC 3.5, критерии 29–34). Категории
+    определяются по прямым связям parent_of и spouse_of относительно первого
+    человека в семье (критерий 30).
+    """
+    visible = [p for p in await person_repo.list_by_family(family_id) if not p.is_placeholder]
+    visible.sort(key=lambda p: p.id)
+
+    if not visible:
+        return visible
+
+    # Зритель — первый человек в семье (с наименьшим ID)
+    viewer = visible[0]
+    relations = await relation_repo.list_by_family(family_id)
+
+    # Строим граф рёбер
+    parent_of: dict[int, set[int]] = {}
+    children_of: dict[int, set[int]] = {}
+    spouses_of: dict[int, set[int]] = {}
+    for relation in relations:
+        if isinstance(relation, ParentOf):
+            parent_of.setdefault(relation.parent_id, set()).add(relation.child_id)
+            children_of.setdefault(relation.child_id, set()).add(relation.parent_id)
+        elif isinstance(relation, SpouseOf):
+            spouses_of.setdefault(relation.a_id, set()).add(relation.b_id)
+            spouses_of.setdefault(relation.b_id, set()).add(relation.a_id)
+
+    # Сортируем по категориям
+    visible.sort(
+        key=lambda p: (
+            _persons_group(p, viewer.id, parent_of, children_of, spouses_of),
+            _fold_name(p.name or ""),
+            p.id,
+        )
+    )
+    return visible
+
+
+def _persons_group(
+    person: Person,
+    viewer_id: int,
+    parent_of: dict[int, set[int]],
+    children_of: dict[int, set[int]],
+    spouses_of: dict[int, set[int]],
+) -> int:
+    """Категория человека относительно зрителя: прямые рёбра parent_of и spouse_of."""
+    if person.id == viewer_id:
+        return _PERSONS_SELF
+    if viewer_id in parent_of.get(person.id, ()):
+        return _PERSONS_PARENT
+    if person.id in spouses_of.get(viewer_id, ()):
+        return _PERSONS_SPOUSE
+    if person.id in parent_of.get(viewer_id, ()):
+        return _PERSONS_CHILD
+    return _PERSONS_OTHER
+
+
+@dataclass(frozen=True, slots=True)
+class PersonEventLine:
+    """Одна строка события в списке /persons, кроме дня рождения (критерий 32)."""
+
+    title: str
+    event_date: date
+    is_recurring_yearly: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PersonListItem:
+    """Человек в списке /persons: данные для format_persons_list."""
+
+    person: Person
+    relation_word: str
+    is_self: bool
+    events: tuple[PersonEventLine, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyPersons:
+    """Результат get_family_persons: семья, люди и роль зрителя."""
+
+    family: Family
+    viewer: Person
+    is_owner: bool
+    items: tuple[PersonListItem, ...]

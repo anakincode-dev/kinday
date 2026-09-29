@@ -217,7 +217,7 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
 - `src/kinday/backup/`: модуль `BackupManager` с ротацией 14 копий
 - `tests/infratest/`: 21 тест для systemd и backup
 
-## Этап 9. Команда /persons
+## Этап 9. Команда /persons (готово)
 
 - `core/services.py`: `get_family_persons` — получение списка людей с родством,
   сортировкой по категориям, вычислением возраста по поясу.
@@ -230,3 +230,6 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
 - `tests/telegram/test_persons.py`: хендлер с фейковым апдейтом aiogram.
 
 Миграций и новых зависимостей нет.
+
+Готово: `uv run pytest tests/core/`, `uv run ruff check .`, `uv run ty check` зелёные, 
+критерии 29–34 закрыты.
