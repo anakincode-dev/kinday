@@ -1180,10 +1180,11 @@ async def choosing_family(message: Message, state: FSMContext, deps: Deps) -> No
 
 
 async def cmd_persons(message: Message, deps: Deps) -> None:
-    account = await _account_of(message, deps)
-    if account is None:
-        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+    """/persons: люди текущей семьи (SPEC 3.5); родство считается от вызвавшего."""
+    if await _current_family_id(message, deps) is None:
         return
+    account = await _account_of(message, deps)
+    assert account is not None  # _current_family_id уже проверил
 
     family_persons = await services.list_family_persons(
         account.id,
@@ -1196,13 +1197,12 @@ async def cmd_persons(message: Message, deps: Deps) -> None:
         deps.clock,
         deps.uow,
     )
-
     if family_persons is None:
         await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
         return
-
-    text = texts.format_persons_list(family_persons)
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        texts.format_persons_list(family_persons), reply_markup=ReplyKeyboardRemove()
+    )
 
 
 async def fallback(message: Message) -> None:

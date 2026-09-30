@@ -48,12 +48,13 @@ from kinday.core.ports import (
     ReminderRepo,
     UnitOfWork,
 )
-from kinday.core.recurrence import age_on
+from kinday.core.recurrence import age_as_of, age_on
 from kinday.core.relations import (
     RelationKind,
     add_sibling,
     add_spouse,
     attach_parent,
+    infer_relation_category,
     infer_relation_text,
 )
 from kinday.core.reminders import (
@@ -62,7 +63,7 @@ from kinday.core.reminders import (
     is_overdue,
     materialize_for_event,
 )
-from kinday.core.texts import reminder_text
+from kinday.core.texts import relation_word_bare, reminder_text
 
 DEFAULT_OFFSETS_DAYS: tuple[int, ...] = (7, 1, 0)
 DEFAULT_TIME_OF_DAY = time(9, 0)
@@ -1450,6 +1451,16 @@ async def enable_delivery(
         return account
 
 
+# Порядок групп в /persons: сам, родители, супруги, дети, остальные (SPEC 3.5).
+_GROUP_SELF = 0
+_GROUP_BY_CATEGORY = {"parent": 1, "spouse": 2, "child": 3}
+_GROUP_OTHER = 4
+
+
+def _name_sort_key(name: str) -> str:
+    return name.casefold().replace("ё", "е")
+
+
 async def list_family_persons(
     account_id: int,
     account_repo: AccountRepo,
@@ -1461,110 +1472,68 @@ async def list_family_persons(
     clock: Clock,
     uow: UnitOfWork,
 ) -> texts.FamilyPersons | None:
-    """Получить список людей семьи с родством и событиями.
+    """Люди текущей семьи аккаунта для /persons; None — если текущей семьи нет.
 
-    Возвращает None, если нет текущей семьи или аккаунта в ней.
-    Группы: себя → 0, родители → 1, супруги → 2, дети → 3, остальные → 4.
-    Внутри: casefold + «ё»→«е», потом id.
+    Состав один для всех участников семьи; родство, пометка «это вы» и порядок
+    групп считаются от человека, за которого аккаунт состоит в семье. Группы:
+    сам, родители, супруги, дети, остальные; внутри — по имени без учёта регистра
+    и «ё», затем по id. Заглушки не показываются. Возраст — на сегодняшнюю дату
+    в поясе аккаунта. Всё читается в одной транзакции.
     """
-
-    from zoneinfo import ZoneInfo
-
-    from kinday.core.recurrence import age_as_of
-    from kinday.core.relations import infer_relation_category
-    from kinday.core.texts import PersonEntry, relation_word_bare
-
     async with uow:
         account = await account_repo.get(account_id)
         if account is None or account.current_family_id is None:
             return None
-
         family = await family_repo.get(account.current_family_id)
         if family is None:
             return None
-
-        # Найти текущего человека (зрителя)
-        current_person_id: int | None = None
-        for membership in await membership_repo.list_by_account(account_id):
-            if membership.family_id == family.id:
-                current_person_id = membership.person_id
-                break
-
-        if current_person_id is None:
-            return None
-
-        current_person = await person_repo.get(current_person_id)
-        if current_person.is_placeholder:
-            return None
-
-        # Получить всех людей семьи
-        all_people = await person_repo.list_by_family(family.id)
-
-        # Получить рёбра семьи
-        relations = await relation_repo.list_by_family(family.id)
-
-        # "Сегодня" в поясе аккаунта
-        now = clock.now().astimezone(ZoneInfo(account.timezone))
-        today = now.date()
-
-        # Отсортировать и отфильтровать
-        entries: list[tuple[PersonEntry, int, int]] = []  # (entry, sort_category, id)
-
-        for person in all_people:
-            if person.is_placeholder:
-                continue
-
-            # Возраст
-            age = age_as_of(person.birth_date or today, today)
-
-            # Родство
-            if person.id == current_person_id:
-                relation = ""
-                sort_category = 0
-            else:
-                category = infer_relation_category(current_person_id, person.id, relations)
-                if category is None:
-                    relation = ""
-                    sort_category = 4
-                else:
-                    relation = relation_word_bare(category, person.gender) or ""
-                    if "отец" in relation or "мать" in relation:
-                        sort_category = 1
-                    elif "муж" in relation or "жен" in relation:
-                        sort_category = 2
-                    elif "сын" in relation or "дочь" in relation:
-                        sort_category = 3
-                    else:
-                        sort_category = 4
-
-            # События (без дня рождения)
-            all_events = await event_repo.list_by_person(person.id)
-            non_birthday_events = tuple(e for e in all_events if e.kind != EventKind.BIRTHDAY)
-
-            entry = PersonEntry(
-                name=person.name or "",
-                birth_date=person.birth_date or today,
-                age=age,
-                relation=relation,
-                is_self=(person.id == current_person_id),
-                events=non_birthday_events,
-            )
-
-            entries.append((entry, sort_category, person.id))
-
-        # Сортировка: категория, потом casefold + «ё»→«е», потом id
-        sorted_entries = sorted(
-            entries,
-            key=lambda x: (
-                x[1],
-                x[0].name.casefold().replace("ё", "е"),
-                x[2],
+        viewer_id = next(
+            (
+                membership.person_id
+                for membership in await membership_repo.list_by_account(account_id)
+                if membership.family_id == family.id
             ),
+            None,
         )
+        if viewer_id is None:
+            return None
 
-        # Обернуть в FamilyPersons
-        return texts.FamilyPersons(
-            family_name=family.name or "",
-            is_owner=(family.owner_account_id == account_id),
-            entries=tuple(e[0] for e in sorted_entries),
+        people = {person.id: person for person in await person_repo.list_by_family(family.id)}
+        relations = await relation_repo.list_by_family(family.id)
+        events_by_person: dict[int, list[Event]] = {}
+        for event in await event_repo.list_by_family(family.id):
+            if event.kind is not EventKind.BIRTHDAY:
+                events_by_person.setdefault(event.person_id, []).append(event)
+
+    today = clock.now().astimezone(ZoneInfo(account.timezone)).date()
+
+    ranked: list[tuple[int, str, int, texts.PersonEntry]] = []
+    for person in people.values():
+        # У настоящего человека дата рождения обязательна (SPEC 3.1); заглушка не показывается.
+        if person.is_placeholder or person.birth_date is None or person.name is None:
+            continue
+        category = infer_relation_category(viewer_id, person.id, people, relations)
+        if person.id == viewer_id:
+            group = _GROUP_SELF
+        else:
+            group = _GROUP_BY_CATEGORY.get(category or "", _GROUP_OTHER)
+        events = sorted(
+            events_by_person.get(person.id, []),
+            key=lambda e: (e.date.month, e.date.day, e.title),
         )
+        entry = texts.PersonEntry(
+            name=person.name,
+            birth_date=person.birth_date,
+            age=age_as_of(person.birth_date, today),
+            relation=relation_word_bare(category, person.gender) if category else "",
+            is_self=person.id == viewer_id,
+            events=tuple(events),
+        )
+        ranked.append((group, _name_sort_key(person.name), person.id, entry))
+
+    ranked.sort(key=lambda item: item[:3])
+    return texts.FamilyPersons(
+        family_name=family.name,
+        is_owner=family.owner_account_id == account_id,
+        entries=tuple(item[3] for item in ranked),
+    )

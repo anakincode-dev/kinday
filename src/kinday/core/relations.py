@@ -397,20 +397,26 @@ def _shortest_relation_path(
 def infer_relation_category(
     from_person_id: int,
     to_person_id: int,
+    people: dict[int, Person],
     relations: Sequence[Relation],
 ) -> str | None:
-    """Категория родства (например, 'parent', 'child') без учёта пола.
+    """Категория родства («parent», «grandchild_child» и т.д.) без учёта пола.
 
-    Обход графа `relations` глубиной не больше трёх шагов. Возвращает None,
-    если родство не выводится или лежит дальше MAX_RELATION_DEPTH.
+    Обход графа `relations` глубиной не больше трёх шагов. None — если родство
+    не выводится, лежит дальше MAX_RELATION_DEPTH, это один и тот же человек или
+    `to_person_id` — заглушка либо неизвестный человек. Заглушки участвуют в обходе
+    как промежуточные узлы — так родство братьев и сестёр выводится и через
+    общую заглушку неизвестного родителя (критерий приёмки 18).
     """
     if from_person_id == to_person_id:
+        return None
+    to_person = people.get(to_person_id)
+    if to_person is None or to_person.is_placeholder:
         return None
 
     path = _shortest_relation_path(from_person_id, to_person_id, relations)
     if path is None:
         return None
-
     return _RELATION_BY_PATH.get(path)
 
 
@@ -420,23 +426,12 @@ def infer_relation_text(
     people: dict[int, Person],
     relations: Sequence[Relation],
 ) -> str:
-    """Родство от получателя к герою события, обход графа `relations` глубиной не больше трёх шагов.
+    """Родство от получателя к герою события в формулировке «ваш брат» / «ваша сестра».
 
-    `people` даёт пол героя события для формулировки («ваш брат» vs
-    «ваша сестра»). Если родство не выводится или лежит дальше
-    MAX_RELATION_DEPTH, возвращает пустую строку. Заглушки (Person.is_placeholder)
-    сами по себе героями события не бывают (см. models.py), но участвуют в обходе
-    как промежуточные узлы — так родство братьев и сестёр выводится и через
-    общую заглушку неизвестного родителя (критерий приёмки 18).
+    `people` даёт пол героя события. Если родство не выводится, возвращает
+    пустую строку (см. `infer_relation_category`).
     """
-    if from_person_id == to_person_id:
-        return ""
-    to_person = people.get(to_person_id)
-    if to_person is None or to_person.is_placeholder:
-        return ""
-
-    category = infer_relation_category(from_person_id, to_person_id, relations)
+    category = infer_relation_category(from_person_id, to_person_id, people, relations)
     if category is None:
         return ""
-
-    return relation_word(category, to_person.gender)
+    return relation_word(category, people[to_person_id].gender)

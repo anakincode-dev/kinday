@@ -58,6 +58,20 @@ _RELATION_WORDS: dict[str, dict[Gender, str]] = {
 }
 
 
+_BARE_RELATION_WORDS: dict[str, dict[Gender, str]] = {
+    "parent": {Gender.MALE: "отец", Gender.FEMALE: "мать"},
+    "child": {Gender.MALE: "сын", Gender.FEMALE: "дочь"},
+    "spouse": {Gender.MALE: "муж", Gender.FEMALE: "жена"},
+    "sibling": {Gender.MALE: "брат", Gender.FEMALE: "сестра"},
+    "grandparent": {Gender.MALE: "дедушка", Gender.FEMALE: "бабушка"},
+    "grandchild": {Gender.MALE: "внук", Gender.FEMALE: "внучка"},
+    "parent_sibling": {Gender.MALE: "дядя", Gender.FEMALE: "тётя"},
+    "sibling_child": {Gender.MALE: "племянник", Gender.FEMALE: "племянница"},
+    "grandparent_parent": {Gender.MALE: "прадедушка", Gender.FEMALE: "прабабушка"},
+    "grandchild_child": {Gender.MALE: "правнук", Gender.FEMALE: "правнучка"},
+}
+
+
 def relation_word(relation: str, gender: Gender | None) -> str:
     """«ваш отец» / «ваша сестра» и т.п. — именительный падеж для вставки в reminder_text.
 
@@ -74,24 +88,13 @@ def relation_word(relation: str, gender: Gender | None) -> str:
 
 
 def relation_word_bare(relation: str, gender: Gender | None) -> str:
-    """Короткое родство для /persons (например, «отец», «сестра»).
+    """Короткое родство для /persons («отец», «сестра», «прадедушка»), без «ваш»/«ваша».
 
-    Без префиксов типа «ваш»/«ваша». Для себя возвращает пустую строку.
+    Пустая строка — для неизвестной категории и для человека без пола.
     """
-    if gender is None or not relation:
+    if gender is None:
         return ""
-
-    words = {
-        "parent": {Gender.MALE: "отец", Gender.FEMALE: "мать"},
-        "child": {Gender.MALE: "сын", Gender.FEMALE: "дочь"},
-        "spouse": {Gender.MALE: "муж", Gender.FEMALE: "жена"},
-        "sibling": {Gender.MALE: "брат", Gender.FEMALE: "сестра"},
-        "grandparent": {Gender.MALE: "дедушка", Gender.FEMALE: "бабушка"},
-        "grandchild": {Gender.MALE: "внук", Gender.FEMALE: "внучка"},
-        "parent_sibling": {Gender.MALE: "дядя", Gender.FEMALE: "тётя"},
-        "sibling_child": {Gender.MALE: "племянник", Gender.FEMALE: "племянница"},
-    }
-    return words.get(relation, {}).get(gender, "")
+    return _BARE_RELATION_WORDS.get(relation, {}).get(gender, "")
 
 
 def _days_word(n: int) -> str:
@@ -168,74 +171,48 @@ def _people_word(n: int) -> str:
     return "человек"
 
 
-def format_persons_list(data: FamilyPersons, max_length: int = 3800) -> str:
-    """Форматтер списка людей семьи для команды /persons (SPEC 3.5).
-
-    Возвращает текст не длиннее max_length символов. Если люди не помещаются,
-    список обрывается на границе человека и заканчивается строкой
-    «… и ещё N человек» с верным склонением.
-    """
-    lines: list[str] = []
-
-    # Заголовок
-    header = f"Семья «{data.family_name}»:"
-    lines.append(header)
-    lines.append("")
-
-    # Форматировать людей
-    formatted_entries: list[str] = []
-    for entry in data.entries:
-        # Строка человека
-        relation_part = f" ({entry.relation})" if entry.relation else ""
-        if entry.is_self:
-            relation_part = " (это вы)"
-
-        person_line = (
-            f"{entry.name} — {entry.birth_date.strftime('%d.%m.%Y')}, "
-            f"{entry.age} {_years_word(entry.age)}{relation_part}"
-        )
-
-        # События человека
-        event_lines: list[str] = []
-        for event in entry.events:
-            if event.is_recurring_yearly:
-                year_suffix = f" (с {event.date.year})"
-                date_str = event.date.strftime("%d.%m")
-                event_line = f"  • {date_str} — {event.title}{year_suffix}"
-            else:
-                date_str = event.date.strftime("%d.%m.%Y")
-                event_line = f"  • {date_str} — {event.title}"
-            event_lines.append(event_line)
-
-        person_section = person_line
-        if event_lines:
-            person_section += "\n" + "\n".join(event_lines)
-
-        formatted_entries.append(person_section)
-
-    # Добавить людей до лимита
-    skipped_count = 0
-    for i, person_section in enumerate(formatted_entries):
-        candidate = "\n".join([*lines, person_section, ""])
-        if len(candidate) > max_length and i > 0:
-            skipped_count = len(formatted_entries) - i
-            break
-        lines.append(person_section)
-        lines.append("")
-
-    # Если только один человек (сам)
-    if len(data.entries) == 1:
-        # Убрать последнюю пустую строку
-        if lines and lines[-1] == "":
-            lines.pop()
-        lines.append("")
-        if data.is_owner:
-            lines.append("Добавьте родственников командой /add_person.")
+def _format_entry(entry: PersonEntry) -> str:
+    relation = "это вы" if entry.is_self else entry.relation
+    suffix = f" ({relation})" if relation else ""
+    lines = [
+        f"{entry.name} — {entry.birth_date.strftime('%d.%m.%Y')}, "
+        f"{entry.age} {_years_word(entry.age)}{suffix}"
+    ]
+    for event in entry.events:
+        if event.is_recurring_yearly:
+            lines.append(
+                f"  • {event.date.strftime('%d.%m')} — {event.title} (с {event.date.year})"
+            )
         else:
-            lines.append("Других людей в семье пока нет.")
-
-    # Если были пропущенные люди
-    if skipped_count > 0:
-        lines.append(f"… и ещё {skipped_count} {_people_word(skipped_count)}")
-
+            lines.append(f"  • {event.date.strftime('%d.%m.%Y')} — {event.title}")
     return "\n".join(lines)
+
+
+def format_persons_list(data: FamilyPersons, max_length: int = 3800) -> str:
+    """Список людей семьи для /persons (SPEC 3.5), не длиннее max_length символов.
+
+    Если все не помещаются, список обрывается на границе человека и заканчивается
+    строкой «… и ещё N человек»; длина этой строки учитывается в лимите, поэтому
+    при нехватке места убирается ещё один человек. Первый человек (сам
+    пользователь) остаётся всегда.
+    """
+    header = f"Семья «{data.family_name}»:"
+    blocks = [_format_entry(entry) for entry in data.entries]
+
+    def render(shown: int) -> str:
+        parts = [header, *blocks[:shown]]
+        hidden = len(blocks) - shown
+        if hidden:
+            parts.append(f"… и ещё {hidden} {_people_word(hidden)}")
+        elif len(blocks) == 1:
+            parts.append(
+                "Добавьте родственников командой /add_person."
+                if data.is_owner
+                else "Других людей в семье пока нет."
+            )
+        return "\n\n".join(parts)
+
+    shown = len(blocks)
+    while shown > 1 and len(render(shown)) > max_length:
+        shown -= 1
+    return render(shown)
