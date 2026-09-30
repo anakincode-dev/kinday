@@ -17,6 +17,7 @@ from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from kinday.core import texts
 from kinday.core.errors import DomainError, DomainErrorCode
 from kinday.core.models import (
     BIRTHDAY_EVENT_TITLE,
@@ -1447,3 +1448,123 @@ async def enable_delivery(
                     event, membership, account, override_repo, reminder_repo, clock
                 )
         return account
+
+
+async def list_family_persons(
+    account_id: int,
+    account_repo: AccountRepo,
+    family_repo: FamilyRepo,
+    membership_repo: MembershipRepo,
+    person_repo: PersonRepo,
+    relation_repo: RelationRepo,
+    event_repo: EventRepo,
+    clock: Clock,
+    uow: UnitOfWork,
+) -> texts.FamilyPersons | None:
+    """Получить список людей семьи с родством и событиями.
+
+    Возвращает None, если нет текущей семьи или аккаунта в ней.
+    Группы: себя → 0, родители → 1, супруги → 2, дети → 3, остальные → 4.
+    Внутри: casefold + «ё»→«е», потом id.
+    """
+
+    from zoneinfo import ZoneInfo
+
+    from kinday.core.recurrence import age_as_of
+    from kinday.core.relations import infer_relation_category
+    from kinday.core.texts import PersonEntry, relation_word_bare
+
+    async with uow:
+        account = await account_repo.get(account_id)
+        if account is None or account.current_family_id is None:
+            return None
+
+        family = await family_repo.get(account.current_family_id)
+        if family is None:
+            return None
+
+        # Найти текущего человека (зрителя)
+        current_person_id: int | None = None
+        for membership in await membership_repo.list_by_account(account_id):
+            if membership.family_id == family.id:
+                current_person_id = membership.person_id
+                break
+
+        if current_person_id is None:
+            return None
+
+        current_person = await person_repo.get(current_person_id)
+        if current_person.is_placeholder:
+            return None
+
+        # Получить всех людей семьи
+        all_people = await person_repo.list_by_family(family.id)
+
+        # Получить рёбра семьи
+        relations = await relation_repo.list_by_family(family.id)
+
+        # "Сегодня" в поясе аккаунта
+        now = clock.now().astimezone(ZoneInfo(account.timezone))
+        today = now.date()
+
+        # Отсортировать и отфильтровать
+        entries: list[tuple[PersonEntry, int, int]] = []  # (entry, sort_category, id)
+
+        for person in all_people:
+            if person.is_placeholder:
+                continue
+
+            # Возраст
+            age = age_as_of(person.birth_date or today, today)
+
+            # Родство
+            if person.id == current_person_id:
+                relation = ""
+                sort_category = 0
+            else:
+                category = infer_relation_category(current_person_id, person.id, relations)
+                if category is None:
+                    relation = ""
+                    sort_category = 4
+                else:
+                    relation = relation_word_bare(category, person.gender) or ""
+                    if "отец" in relation or "мать" in relation:
+                        sort_category = 1
+                    elif "муж" in relation or "жен" in relation:
+                        sort_category = 2
+                    elif "сын" in relation or "дочь" in relation:
+                        sort_category = 3
+                    else:
+                        sort_category = 4
+
+            # События (без дня рождения)
+            all_events = await event_repo.list_by_person(person.id)
+            non_birthday_events = tuple(e for e in all_events if e.kind != EventKind.BIRTHDAY)
+
+            entry = PersonEntry(
+                name=person.name or "",
+                birth_date=person.birth_date or today,
+                age=age,
+                relation=relation,
+                is_self=(person.id == current_person_id),
+                events=non_birthday_events,
+            )
+
+            entries.append((entry, sort_category, person.id))
+
+        # Сортировка: категория, потом casefold + «ё»→«е», потом id
+        sorted_entries = sorted(
+            entries,
+            key=lambda x: (
+                x[1],
+                x[0].name.casefold().replace("ё", "е"),
+                x[2],
+            ),
+        )
+
+        # Обернуть в FamilyPersons
+        return texts.FamilyPersons(
+            family_name=family.name or "",
+            is_owner=(family.owner_account_id == account_id),
+            entries=tuple(e[0] for e in sorted_entries),
+        )

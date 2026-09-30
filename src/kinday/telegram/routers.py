@@ -23,7 +23,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
-from kinday.core import services
+from kinday.core import services, texts
 from kinday.core.models import Account, Event, Gender, Person
 from kinday.core.ports import (
     AccountRepo,
@@ -95,6 +95,7 @@ MENU = (
     "/timezone — сменить часовой пояс\n"
     "/settings — за сколько дней и во сколько напоминать\n"
     "/event_settings — своё расписание для одного события\n"
+    "/persons — люди семьи\n"
     "/family — выбрать текущую семью\n"
     "/cancel — прервать диалог"
 )
@@ -1178,6 +1179,32 @@ async def choosing_family(message: Message, state: FSMContext, deps: Deps) -> No
     )
 
 
+async def cmd_persons(message: Message, deps: Deps) -> None:
+    account = await _account_of(message, deps)
+    if account is None:
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+
+    family_persons = await services.list_family_persons(
+        account.id,
+        deps.account,
+        deps.family,
+        deps.membership,
+        deps.person,
+        deps.relation,
+        deps.event,
+        deps.clock,
+        deps.uow,
+    )
+
+    if family_persons is None:
+        await message.answer(NO_FAMILY, reply_markup=ReplyKeyboardRemove())
+        return
+
+    text = texts.format_persons_list(family_persons)
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+
 async def fallback(message: Message) -> None:
     await message.answer(NOT_UNDERSTOOD, reply_markup=ReplyKeyboardRemove())
 
@@ -1211,6 +1238,7 @@ def build_router() -> Router:
     router.message.register(cmd_timezone, Command("timezone"))
     router.message.register(cmd_settings, Command("settings"))
     router.message.register(cmd_event_settings, Command("event_settings"))
+    router.message.register(cmd_persons, Command("persons"))
     router.message.register(cmd_family, Command("family"))
 
     router.message.register(new_family_name, NewFamily.name, F.text)

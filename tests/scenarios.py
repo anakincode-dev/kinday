@@ -23,12 +23,14 @@ from kinday.core.services import (
     delete_person,
     enable_delivery,
     issue_invite,
+    list_family_persons,
     revoke_invite,
     set_current_family,
     set_override,
     update_account_settings,
     update_person,
 )
+from kinday.core.texts import FamilyPersons
 
 
 async def create_family_for(
@@ -302,5 +304,24 @@ async def set_current_family_in(world: World, *, account_id: int, family_id: int
         family_id,
         world.account,
         world.membership,
+        world.uow,
+    )
+
+
+async def list_family_persons_in(
+    world: World,
+    *,
+    clock: Clock,
+    account_id: int,
+) -> FamilyPersons | None:
+    return await list_family_persons(
+        account_id,
+        world.account,
+        world.family,
+        world.membership,
+        world.person,
+        world.relation,
+        world.event,
+        clock,
         world.uow,
     )

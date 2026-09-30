@@ -394,6 +394,26 @@ def _shortest_relation_path(
     return None
 
 
+def infer_relation_category(
+    from_person_id: int,
+    to_person_id: int,
+    relations: Sequence[Relation],
+) -> str | None:
+    """Категория родства (например, 'parent', 'child') без учёта пола.
+
+    Обход графа `relations` глубиной не больше трёх шагов. Возвращает None,
+    если родство не выводится или лежит дальше MAX_RELATION_DEPTH.
+    """
+    if from_person_id == to_person_id:
+        return None
+
+    path = _shortest_relation_path(from_person_id, to_person_id, relations)
+    if path is None:
+        return None
+
+    return _RELATION_BY_PATH.get(path)
+
+
 def infer_relation_text(
     from_person_id: int,
     to_person_id: int,
@@ -415,11 +435,7 @@ def infer_relation_text(
     if to_person is None or to_person.is_placeholder:
         return ""
 
-    path = _shortest_relation_path(from_person_id, to_person_id, relations)
-    if path is None:
-        return ""
-
-    category = _RELATION_BY_PATH.get(path)
+    category = infer_relation_category(from_person_id, to_person_id, relations)
     if category is None:
         return ""
 
