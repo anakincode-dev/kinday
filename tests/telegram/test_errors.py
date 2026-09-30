@@ -69,7 +69,7 @@ async def test_unhandled_error_gives_one_short_answer_and_resets_dialog(
     await telegram.send(SECRET_NAME, user_id=ANTON)
     await telegram.send("женский", user_id=ANTON)
     await telegram.send("15.06.1990", user_id=ANTON)
-    answers = await telegram.send("Москва", user_id=ANTON)
+    answers = await telegram.send("Санкт-Петербург", user_id=ANTON)
 
     assert answers == [GENERIC_FAILURE]
     assert await sqlite_world.account.get_by_telegram_user_id(ANTON) is None
@@ -95,7 +95,7 @@ async def test_error_log_keeps_facts_and_drops_user_text(
     await telegram.send("женский", user_id=ANTON)
     await telegram.send("15.06.1990", user_id=ANTON)
     with caplog.at_level(logging.INFO):
-        await telegram.send("Москва", user_id=ANTON)
+        await telegram.send("Санкт-Петербург", user_id=ANTON)
 
     # Именно наша запись, а не любая строка журнала: иначе утверждение про
     # update_id прошло бы за счёт штатного «Update id=... is handled» от aiogram.
@@ -169,7 +169,7 @@ async def _family_with_two_parents(telegram: FakeTelegram, *, user_id: int = ANT
     await telegram.send("Антон", user_id=user_id)
     await telegram.send("мужской", user_id=user_id)
     await telegram.send("15.06.1990", user_id=user_id)
-    await telegram.send("Москва", user_id=user_id)
+    await telegram.send("Санкт-Петербург", user_id=user_id)
     for relation, name, gender, birth in (
         ("отец", "Пётр", "мужской", "01.03.1980"),
         ("мать", "Ольга", "женский", "05.05.1960"),

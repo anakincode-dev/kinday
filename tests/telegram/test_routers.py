@@ -34,7 +34,7 @@ async def _create_family(
     name: str = "Антон",
     gender: str = "мужской",
     birth: str = "15.06.1990",
-    city: str = "Москва",
+    city: str = "Санкт-Петербург",
 ) -> list[str]:
     await telegram.send("/new_family", user_id=user_id)
     await telegram.send(name, user_id=user_id)
@@ -80,7 +80,7 @@ async def test_new_family_dialog_creates_family_and_binds_chat(
     Чат обязателен: без него тик считает, что отправлять некуда, и закрывает
     напоминание как failed (SPEC 5.5).
     """
-    answers = await _create_family(telegram, user_id=ANTON, city="Москва")
+    answers = await _create_family(telegram, user_id=ANTON, city="Санкт-Петербург")
 
     assert "создана" in _answer(answers)
     account = await sqlite_world.account.get_by_telegram_user_id(ANTON)
@@ -120,7 +120,7 @@ async def test_unknown_city_is_rejected_and_dialog_continues(
     assert "город" in _answer(rejected)
     assert await sqlite_world.account.get_by_telegram_user_id(ANTON) is None
 
-    accepted = await telegram.send("Москва", user_id=ANTON)
+    accepted = await telegram.send("Санкт-Петербург", user_id=ANTON)
     assert "создана" in _answer(accepted)
 
 
@@ -134,7 +134,7 @@ async def test_invalid_birth_date_asks_again(telegram: FakeTelegram, sqlite_worl
 
     assert "дд.мм.гггг" in _answer(rejected)
     await telegram.send("15.06.1990", user_id=ANTON)
-    assert "создана" in _answer(await telegram.send("Москва", user_id=ANTON))
+    assert "создана" in _answer(await telegram.send("Санкт-Петербург", user_id=ANTON))
 
 
 @pytest.mark.asyncio
@@ -694,7 +694,7 @@ async def test_non_text_message_inside_dialog_gets_answer(telegram: FakeTelegram
     assert "/cancel" in _answer(answers)
     # Диалог не сломался: следующая настоящая дата принимается.
     await telegram.send("15.06.1990", user_id=ANTON)
-    assert "создана" in _answer(await telegram.send("Москва", user_id=ANTON))
+    assert "создана" in _answer(await telegram.send("Санкт-Петербург", user_id=ANTON))
 
 
 @pytest.mark.asyncio
