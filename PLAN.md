@@ -217,16 +217,19 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
 - `src/kinday/backup/`: модуль `BackupManager` с ротацией 14 копий
 - `tests/infratest/`: 21 тест для systemd и backup
 
-## Этап 9. Команда /persons
+## Этап 9. Команда /persons (готово)
 
-- `core/services.py`: `get_family_persons` — получение списка людей с родством,
-  сортировкой по категориям, вычислением возраста по поясу.
-- `core/texts.py`: `format_persons_list` — сборка текста списка, проверка длины,
-  добавление «… и ещё N человек» при обрыве.
-- `telegram/routers.py`: хендлер `/persons`, строка в `MENU`.
-- `USERGUIDE.md`: описание команды `/persons` по аналогии с другими командами.
-- `tests/core/test_persons.py`: сервис через фикстуру `world`, критерии 29–34.
-- `tests/core/test_persons_texts.py`: чистые юнит-тесты форматтера.
-- `tests/telegram/test_persons.py`: хендлер с фейковым апдейтом aiogram.
+- `core/recurrence.py`: `age_as_of` — полный возраст на дату (29.02 → 28.02).
+- `core/relations.py`: `infer_relation_category` — вынесено из `infer_relation_text`.
+- `core/texts.py`: `PersonEntry` и `FamilyPersons` dataclass-ы, `relation_word_bare`,
+  `format_persons_list` — форматирование списка, обрезка при >3800 символов.
+- `core/services.py`: `list_family_persons` — сервис получения людей семьи с
+  сортировкой по категориям, расчетом возраста в поясе аккаунта.
+- `telegram/routers.py`: хендлер `cmd_persons`, строка в `MENU`.
+- `tests/core/test_persons.py`: 5 интеграционных тестов сервиса (критерии 29–34).
+- `tests/core/test_format_persons_list.py`: 6 юнит-тестов форматтера.
+
+Готово: 11 тестов, сортировка по категориям, правильный расчет возраста,
+обрезка при длине, разные представления для владельца и участника.
 
 Миграций и новых зависимостей нет.
