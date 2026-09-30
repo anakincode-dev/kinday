@@ -219,16 +219,17 @@ Systemd-юнит, systemd-таймер бэкапа (`sqlite3.Connection.backup`
 
 ## Этап 9. Команда /persons (готово)
 
-- `core/services.py`: `get_family_persons` — получение списка людей с родством,
-  сортировкой по категориям, вычислением возраста по поясу.
-- `core/texts.py`: `format_persons_list` — сборка текста списка, проверка длины,
-  добавление «… и ещё N человек» при обрыве.
-- `telegram/routers.py`: хендлер `/persons`, строка в `MENU`.
-- `USERGUIDE.md`: описание команды `/persons` по аналогии с другими командами.
-- `tests/core/test_persons.py`: сервис через фикстуру `repos`, критерии 29–34.
-- `tests/core/test_persons_texts.py`: чистые юнит-тесты форматтера.
-- `tests/telegram/test_persons_command.py`: хендлер с фейковым апдейтом aiogram.
-
-Готово: все тесты проходят, критерии 29–34 покрыты.
+- `core/recurrence.py`: `age_as_of(birth_date, today)` — полный возраст на дату (29.02 → 28.02).
+- `core/relations.py`: `infer_relation_category(from_id, to_id, people, relations)` — категория
+  родства без пола; `infer_relation_text` строится поверх неё.
+- `core/texts.py`: `PersonEntry`, `FamilyPersons`, `relation_word_bare` (все 10 категорий,
+  таблица на уровне модуля), `format_persons_list(data, max_length=3800)` — длина хвоста
+  «… и ещё N человек» входит в лимит.
+- `core/services.py`: `list_family_persons` — одна транзакция, один `event_repo.list_by_family`,
+  группы по категории родства, события по (месяц, день, название), «сегодня» в поясе аккаунта.
+- `telegram/routers.py`: `cmd_persons`, строка «/persons — люди семьи» в `MENU`.
+- Тесты: `tests/core/test_persons.py`, `tests/core/test_format_persons_list.py`,
+  `tests/telegram/test_persons_command.py`.
+- `USERGUIDE.md` — раздел «Список людей».
 
 Миграций и новых зависимостей нет.

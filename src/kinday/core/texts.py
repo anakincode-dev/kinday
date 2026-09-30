@@ -2,10 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
-from typing import Any
 
-from kinday.core.models import Gender
+from kinday.core.models import Event, Gender
+
+
+@dataclass(frozen=True, slots=True)
+class PersonEntry:
+    """Запись человека в списке людей семьи для команды /persons."""
+
+    name: str
+    birth_date: date
+    age: int
+    relation: str
+    is_self: bool
+    events: tuple[Event, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyPersons:
+    """Список людей семьи, отформатированный для команды /persons."""
+
+    family_name: str
+    is_owner: bool
+    entries: tuple[PersonEntry, ...]
+
 
 _MONTHS_GENITIVE = (
     "января",
@@ -36,6 +58,20 @@ _RELATION_WORDS: dict[str, dict[Gender, str]] = {
 }
 
 
+_BARE_RELATION_WORDS: dict[str, dict[Gender, str]] = {
+    "parent": {Gender.MALE: "отец", Gender.FEMALE: "мать"},
+    "child": {Gender.MALE: "сын", Gender.FEMALE: "дочь"},
+    "spouse": {Gender.MALE: "муж", Gender.FEMALE: "жена"},
+    "sibling": {Gender.MALE: "брат", Gender.FEMALE: "сестра"},
+    "grandparent": {Gender.MALE: "дедушка", Gender.FEMALE: "бабушка"},
+    "grandchild": {Gender.MALE: "внук", Gender.FEMALE: "внучка"},
+    "parent_sibling": {Gender.MALE: "дядя", Gender.FEMALE: "тётя"},
+    "sibling_child": {Gender.MALE: "племянник", Gender.FEMALE: "племянница"},
+    "grandparent_parent": {Gender.MALE: "прадедушка", Gender.FEMALE: "прабабушка"},
+    "grandchild_child": {Gender.MALE: "правнук", Gender.FEMALE: "правнучка"},
+}
+
+
 def relation_word(relation: str, gender: Gender | None) -> str:
     """«ваш отец» / «ваша сестра» и т.п. — именительный падеж для вставки в reminder_text.
 
@@ -49,6 +85,16 @@ def relation_word(relation: str, gender: Gender | None) -> str:
     if gender is None:
         return ""
     return _RELATION_WORDS.get(relation, {}).get(gender, "")
+
+
+def relation_word_bare(relation: str, gender: Gender | None) -> str:
+    """Короткое родство для /persons («отец», «сестра», «прадедушка»), без «ваш»/«ваша».
+
+    Пустая строка — для неизвестной категории и для человека без пола.
+    """
+    if gender is None:
+        return ""
+    return _BARE_RELATION_WORDS.get(relation, {}).get(gender, "")
 
 
 def _days_word(n: int) -> str:
@@ -116,84 +162,6 @@ def reminder_text(
     return f"{lead}: {event_title} — {subject}. {formatted_date}."
 
 
-def format_persons_list(
-    family_name: str,
-    persons_data: list[tuple[Any, str, list[Any]]],
-    current_date: date,
-) -> str:
-    """Форматтер списка людей семьи для команды /persons (этап 9, SPEC 3.5).
-
-    Возвращает одно сообщение не длиннее 3800 символов. Если люди не помещаются,
-    список обрывается на границе человека и заканчивается строкой
-    «… и ещё N человек» с верным склонением (критерий 33).
-
-    persons_data — список кортежей (Person, relation_category, events):
-    - Person: запись человека (должна иметь name, birth_date, gender)
-    - relation_category: текст родства или «(это вы)»
-    - events: список событий (должны иметь title, date, is_recurring_yearly)
-    """
-
-    lines: list[str] = [f"Семья «{family_name}»:\n"]
-    total_length = len(lines[0])
-    skipped_count = 0
-
-    for person, relation_text, events in persons_data:
-        # Строка человека: имя, дата, возраст, родство
-        age = _calculate_age(person.birth_date, current_date)
-        birth_str = person.birth_date.strftime("%d.%m.%Y")
-        age_str = f"{age} {_years_word(age)}"
-        relation_str = (
-            f" ({relation_text})"
-            if relation_text and relation_text != "(это вы)"
-            else f" {relation_text}"
-        )
-
-        person_line = f"{person.name} — {birth_str}, {age_str}{relation_str}"
-
-        # События человека
-        event_lines: list[str] = []
-        for event in events:
-            if event.is_recurring_yearly:
-                year_suffix = f" (с {event.date.year})"
-                date_str = f"{event.date.day:02d}.{event.date.month:02d}"
-                event_line = f"  • {date_str} — {event.title}{year_suffix}"
-            else:
-                date_str = f"{event.date.day:02d}.{event.date.month:02d}.{event.date.year}"
-                event_line = f"  • {date_str} — {event.title}"
-            event_lines.append(event_line)
-
-        person_section = person_line + ("\n" + "\n".join(event_lines) if event_lines else "")
-
-        # Проверить, поместится ли в 3800
-        candidate_length = total_length + len(person_section) + 1  # +1 для перевода строки
-        if candidate_length > 3800 and lines[0] != lines[-1]:  # Если не первый человек
-            skipped_count += 1
-            continue
-
-        lines.append(person_section)
-        total_length += len(person_section) + 1
-
-    # Если были пропущенные люди, добавить "… и ещё"
-    if skipped_count > 0:
-        remaining_count = len(persons_data) - len(lines) + 1
-        if remaining_count < 0:
-            remaining_count = skipped_count
-        dots_line = f"\n… и ещё {remaining_count} {_people_word(remaining_count)}"
-        lines.append(dots_line)
-
-    return "\n".join(lines)
-
-
-def _calculate_age(birth_date: date | None, current_date: date) -> int:
-    """Вычислить возраст на текущую дату."""
-    if birth_date is None:
-        return 0
-    age = current_date.year - birth_date.year
-    if (current_date.month, current_date.day) < (birth_date.month, birth_date.day):
-        age -= 1
-    return age
-
-
 def _people_word(n: int) -> str:
     """Склонение слова 'человек' по количеству."""
     if n % 10 == 1 and n % 100 != 11:
@@ -201,3 +169,50 @@ def _people_word(n: int) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return "человека"
     return "человек"
+
+
+def _format_entry(entry: PersonEntry) -> str:
+    relation = "это вы" if entry.is_self else entry.relation
+    suffix = f" ({relation})" if relation else ""
+    lines = [
+        f"{entry.name} — {entry.birth_date.strftime('%d.%m.%Y')}, "
+        f"{entry.age} {_years_word(entry.age)}{suffix}"
+    ]
+    for event in entry.events:
+        if event.is_recurring_yearly:
+            lines.append(
+                f"  • {event.date.strftime('%d.%m')} — {event.title} (с {event.date.year})"
+            )
+        else:
+            lines.append(f"  • {event.date.strftime('%d.%m.%Y')} — {event.title}")
+    return "\n".join(lines)
+
+
+def format_persons_list(data: FamilyPersons, max_length: int = 3800) -> str:
+    """Список людей семьи для /persons (SPEC 3.5), не длиннее max_length символов.
+
+    Если все не помещаются, список обрывается на границе человека и заканчивается
+    строкой «… и ещё N человек»; длина этой строки учитывается в лимите, поэтому
+    при нехватке места убирается ещё один человек. Первый человек (сам
+    пользователь) остаётся всегда.
+    """
+    header = f"Семья «{data.family_name}»:"
+    blocks = [_format_entry(entry) for entry in data.entries]
+
+    def render(shown: int) -> str:
+        parts = [header, *blocks[:shown]]
+        hidden = len(blocks) - shown
+        if hidden:
+            parts.append(f"… и ещё {hidden} {_people_word(hidden)}")
+        elif len(blocks) == 1:
+            parts.append(
+                "Добавьте родственников командой /add_person."
+                if data.is_owner
+                else "Других людей в семье пока нет."
+            )
+        return "\n\n".join(parts)
+
+    shown = len(blocks)
+    while shown > 1 and len(render(shown)) > max_length:
+        shown -= 1
+    return render(shown)

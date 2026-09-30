@@ -26,3 +26,13 @@ def next_occurrence(event_date: date, after: date) -> date:
 def age_on(event_date: date, occurrence: date) -> int:
     """Возраст или номер годовщины на дату наступления события."""
     return occurrence.year - event_date.year
+
+
+def age_as_of(birth_date: date, today: date) -> int:
+    """Полный возраст на дату. День рождения 29.02 в невисокосный год считается за 28.02."""
+    age = today.year - birth_date.year
+    # Проверить, уже ли прошёл день рождения в этом году
+    birth_this_year = _occurrence_in_year(birth_date, today.year)
+    if today < birth_this_year:
+        age -= 1
+    return age
