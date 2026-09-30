@@ -235,10 +235,15 @@ def _cities_keyboard() -> ReplyKeyboardMarkup:
     return _keyboard(list(CITIES), per_row=3)
 
 
+def _city_key(name: str) -> str:
+    """Название для сравнения: без регистра и без пояснения в скобках («(Германия)»)."""
+    return name.split("(", 1)[0].strip().casefold()
+
+
 def _timezone_of(text: str) -> str | None:
-    wanted = text.strip().casefold()
+    wanted = _city_key(text)
     for city, timezone in CITIES.items():
-        if city.casefold() == wanted:
+        if _city_key(city) == wanted:
             return timezone
     return None
 
